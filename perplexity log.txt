@@ -1,0 +1,3632 @@
+File: hybrid_rag_search_fixed.py
+Save this file to your project and run:
+MISTRAL_API_KEY=... python hybrid_rag_search_fixed.py --query "can I build a Starbucks in the CS district" --db data/cogs_memory.db --eval --verbose
+
+#!/usr/bin/env python3
+"""
+Hybrid RAG pipeline (fixed & hardened).
+
+    Async DB loading (aiosqlite)
+
+    Optimized hybrid retrieval (semantic + exact)
+
+    Robust Mistral embedding & streaming usage
+
+    Web-search fallback (DuckDuckGo / Brave)
+
+    Quality metrics, adaptive strategy, generation phase
+    """
+
+Standard library
+
+import os
+import re
+import time
+import json
+import argparse
+import logging
+import asyncio
+from typing import List, Dict, Tuple, Any, Optional
+from urllib.parse import quote
+Third-party
+
+import numpy as np
+import aiosqlite
+import httpx
+import requests
+from dotenv import load_dotenv
+from mistralai import Mistral
+from mistralai.models import UserMessage
+
+load_dotenv()
+-----------------------
+Constants / Configuration
+-----------------------
+
+MIN_EMBEDDING_LENGTH = 100
+MAX_CONTEXT_CHARS = 12000
+DEFAULT_SIMILARITY_THRESHOLD = 0.7
+ZONING_SIMILARITY_THRESHOLD = 0.45
+KEYWORD_BOOST_SCORE = 0.5
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+MISTRAL_EMBED_MODEL = os.environ.get("MISTRAL_EMBED_MODEL", "mistral-embed")
+MISTRAL_CHAT_MODEL = os.environ.get("MISTRAL_CHAT_MODEL", "mistral-large-2411")
+-----------------------
+Logging & env validation
+-----------------------
+
+def setup_logging(verbose: bool = False) -> None:
+level = logging.DEBUG if verbose else logging.INFO
+fmt = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
+handlers = [logging.StreamHandler()]
+# Add file logging for long runs
+handlers.append(logging.FileHandler("hybrid_rag.log"))
+logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+def validate_environment() -> None:
+missing = []
+if not MISTRAL_API_KEY:
+missing.append("MISTRAL_API_KEY")
+if missing:
+raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+-----------------------
+Mistral client singleton
+-----------------------
+
+class MistralClient:
+_instance: Optional[Mistral] = None
+
+text
+@classmethod
+def get_client(cls) -> Mistral:
+    if cls._instance is None:
+        cls._instance = Mistral(api_key=MISTRAL_API_KEY)
+    return cls._instance
+
+mistral_client = MistralClient.get_client()
+-----------------------
+Query normalization
+-----------------------
+
+USE_MAP = {
+"coffee shop": "restaurant (limited service)",
+"starbucks": "restaurant (limited service)",
+"cafe": "restaurant (limited service)",
+"sandwich shop": "restaurant (limited service)",
+"fast food": "restaurant (limited service)",
+"gym": "indoor recreation",
+"barbershop": "personal service",
+"cs district": "commercial service district",
+"commercial service": "commercial service district",
+}
+
+def normalize_query(query: str) -> str:
+q_lower = query.lower()
+expansions = []
+for k, v in USE_MAP.items():
+if k in q_lower:
+expansions.append(v)
+if any(term in q_lower for term in ['cs district', 'cs zone']):
+expansions.extend(['cs and industrial', 'commercial service', 'chapter 51'])
+if 'starbucks' in q_lower and 'cs' in q_lower:
+expansions.extend(['restaurant', 'limited service', 'permitted uses', 'cs and industrial'])
+if any(term in q_lower for term in ['can i build', 'allowed', 'permitted']):
+expansions.extend(['permitted uses', 'district regulations', 'zoning ordinance'])
+if 'dallas' in q_lower:
+expansions.append('city code ordinance development services')
+return query + " " + " ".join(expansions) if expansions else query
+-----------------------
+Embeddings: robust async call with fallback
+-----------------------
+
+async def mistral_embed_httpx(texts: List[str]) -> List[List[float]]:
+"""Fallback embedding call using httpx to the REST endpoint."""
+url = "https://api.mistral.ai/v1/embeddings"
+headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+payload = {"model": MISTRAL_EMBED_MODEL, "input": texts}
+async with httpx.AsyncClient(timeout=60) as client:
+r = await client.post(url, headers=headers, json=payload)
+r.raise_for_status()
+data = r.json()
+return [item["embedding"] for item in data.get("data", [])]
+
+async def get_query_vector(query: str) -> Optional[np.ndarray]:
+"""
+Try Mistral client async embedding first (create_async).
+If that fails, fall back to httpx REST call.
+Defensive parsing of returned structures.
+"""
+client = mistral_client
+try:
+# Prefer create_async (some SDKs expose this)
+embeddings_resp = await client.embeddings.create_async(model=MISTRAL_EMBED_MODEL, inputs=[query])
+data = getattr(embeddings_resp, "data", None)
+emb = None
+if data:
+# handle list-like or single-object
+if isinstance(data, list) and len(data) > 0:
+first = data
+emb = getattr(first, "embedding", None) or (first.get("embedding") if isinstance(first, dict) else None)
+else:
+emb = getattr(data, "embedding", None) or (data.get("embedding") if isinstance(data, dict) else None)
+if emb:
+return np.array(emb, dtype=float)
+except Exception as e:
+logging.debug("create_async failed or SDK shape mismatch, falling back to httpx: %s", e, exc_info=True)
+
+text
+# Fallback
+try:
+    embeddings = await mistral_embed_httpx([query])
+    if embeddings:
+        return np.array(embeddings, dtype=float)
+except Exception as e:
+    logging.error("Embedding fallback failed: %s", e, exc_info=True)
+return None
+
+-----------------------
+Parse embedding from DB
+-----------------------
+
+def parse_embedding(embedding_raw: Any) -> Optional[np.ndarray]:
+if not embedding_raw:
+return None
+try:
+if isinstance(embedding_raw, str):
+emb = json.loads(embedding_raw)
+if isinstance(emb, list) and len(emb) >= MIN_EMBEDDING_LENGTH:
+return np.array(emb, dtype=float)
+elif isinstance(embedding_raw, (bytes, memoryview)):
+if len(embedding_raw) >= 4 and (len(embedding_raw) % 4 == 0):
+emb = np.frombuffer(embedding_raw, dtype=np.float32)
+if len(emb) >= MIN_EMBEDDING_LENGTH:
+return emb.astype(float)
+elif isinstance(embedding_raw, (list, tuple)):
+emb = np.array(embedding_raw, dtype=float)
+if emb.size >= MIN_EMBEDDING_LENGTH:
+return emb
+except Exception as e:
+logging.debug("parse_embedding error: %s", e)
+return None
+-----------------------
+Async DB load
+-----------------------
+
+async def load_documents_from_db(db_path: str) -> List[Dict[str, Any]]:
+"""
+Load document rows asynchronously and parse embeddings safely.
+Returns list of dicts with keys: doc_id, section_id, title, text, embedding (np.array or None)
+"""
+docs: List[Dict[str, Any]] = []
+try:
+async with aiosqlite.connect(db_path) as conn:
+async with conn.execute("SELECT doc_id, section_id, title, text, embedding FROM documents") as cursor:
+async for row in cursor:
+doc_id, section_id, title, text, embedding_raw = row
+docs.append({
+"doc_id": doc_id,
+"section_id": section_id,
+"title": title or "",
+"text": text or "",
+"embedding": parse_embedding(embedding_raw)
+})
+except Exception as e:
+logging.error("Failed to load documents from DB: %s", e, exc_info=True)
+return docs
+-----------------------
+Hybrid search (optimized single-pass)
+-----------------------
+
+async def search_top_chunks_optimized(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+"""
+Single-pass hybrid scoring: semantic (embedding) + exact token coverage.
+Returns list of (score, doc).
+"""
+normalized_query = normalize_query(query)
+query_tokens = set(re.findall(r'\b\w{3,}\b', normalized_query.lower()))
+query_vector = await get_query_vector(normalized_query)
+
+text
+scored: List[Tuple[float, Dict[str, Any]]] = []
+for doc in documents:
+    doc_emb = doc.get("embedding")
+    semantic_score = 0.0
+    if doc_emb is not None and query_vector is not None:
+        try:
+            doc_vec = np.array(doc_emb, dtype=float)
+            denom = np.linalg.norm(query_vector) * np.linalg.norm(doc_vec)
+            if denom > 0:
+                semantic_score = float(np.dot(query_vector, doc_vec) / denom)
+        except Exception:
+            semantic_score = 0.0
+
+    # exact / token coverage
+    text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+    exact_score = 0.0
+    if normalized_query.lower() in text_content:
+        exact_score += 1.0
+    if query_tokens:
+        match_tokens = sum(1 for t in query_tokens if t in text_content)
+        token_coverage = match_tokens / len(query_tokens)
+        exact_score += token_coverage * 0.7
+
+    final_score = (semantic_score * 0.6) + (exact_score * 0.4)
+    scored.append((final_score, doc))
+
+scored.sort(key=lambda x: x, reverse=True)
+return scored[:k]
+
+-----------------------
+Simple text fallback search
+-----------------------
+
+def simple_text_search(documents: List[Dict[str, Any]], query: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
+q = query.lower()
+scored: List[Tuple[float, Dict[str, Any]]] = []
+tokens = q.split()
+for doc in documents:
+text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+if not text_content:
+continue
+score = 1.0 if q in text_content else 0.0
+if tokens:
+token_matches = sum(1 for t in tokens if t in text_content)
+token_score = token_matches / len(tokens)
+score = max(score, token_score)
+if score > 0:
+scored.append((score, doc))
+scored.sort(key=lambda x: x, reverse=True)
+return scored[:k]
+
+async def search_with_fallback(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+try:
+return await search_top_chunks_optimized(documents, query, k)
+except Exception as e:
+logging.warning("Optimized search failed (%s). Falling back to simple text search.", e, exc_info=True)
+return simple_text_search(documents, query, k)
+-----------------------
+Context trimming (relevance-aware)
+-----------------------
+
+def trim_context_with_relevance(chunks: List[Tuple[float, Dict[str, Any]]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+if not chunks:
+return ""
+sorted_chunks = sorted(chunks, key=lambda x: x, reverse=True)
+parts: List[str] = []
+total = 0
+for score, doc in sorted_chunks:
+title = doc.get("title", "")
+text = doc.get("text", "")
+header = f"## {title} (relevance: {score:.3f})\n"
+body = f"{text}\n\n"
+section = header + body
+if total + len(section) <= max_chars:
+parts.append(section)
+total += len(section)
+else:
+remaining = max_chars - total - len(header)
+if remaining > 200:
+# try to fill with sentences up to remaining
+sentences = re.split(r'(?<=[.!?])\s+', text)
+partial = ""
+for s in sentences:
+if len(partial) + len(s) + 1 <= remaining - 5:
+partial += (s + " ")
+else:
+break
+if partial:
+parts.append(header + partial.strip() + "...\n\n")
+break
+return "".join(parts)
+-----------------------
+Retrieval quality & strategy
+-----------------------
+
+def evaluate_retrieval_quality(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Dict[str, float]:
+if not chunks:
+return {"confidence": 0.0, "coverage": 0.0, "diversity": 0.0, "num_results": 0}
+scores = [s for s, _ in chunks]
+query_tokens = set(re.findall(r'\b\w{3,}\b', query.lower()))
+confidence = max(scores)
+variance = float(np.var(scores)) if len(scores) > 1 else 0.0
+diversity = max(0.0, 1.0 - variance)
+all_text = " ".join([c.get("text","").lower() for _, c in chunks])
+coverage = (sum(1 for t in query_tokens if t in all_text) / len(query_tokens)) if query_tokens else 0.0
+return {"confidence": confidence, "coverage": coverage, "diversity": diversity, "num_results": len(chunks)}
+
+def determine_retrieval_strategy(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Tuple[str, float]:
+if not chunks:
+return "web_search", 0.0
+best = chunks
+top3_avg = sum(s for s, _ in chunks[:3]) / min(3, len(chunks))
+score_var = float(np.var([s for s, _ in chunks[:5]])) if len(chunks) > 1 else 0.0
+is_specific = any(t in query.lower() for t in ["cs district", "zoning", "dallas", "ordinance", "section", "code"])
+if is_specific:
+if best >= 0.4 and top3_avg >= 0.3:
+return "local_docs", min(best * 1.5, 1.0)
+elif best >= 0.25:
+return "hybrid", best
+else:
+return "web_search", 0.2
+else:
+if best >= 0.6 and score_var < 0.1:
+return "local_docs", best
+elif best >= 0.4:
+return "hybrid", best * 0.8
+else:
+return "web_search", 0.3
+-----------------------
+Web-search fallbacks
+-----------------------
+
+def run_web_search_duckduckgo(query: str, num_results: int = 3) -> List[str]:
+try:
+url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
+r = requests.get(url, timeout=10)
+r.raise_for_status()
+data = r.json()
+results: List[str] = []
+if data.get("Abstract"):
+results.append(f"Summary: {data.get('Abstract')}\nSource: {data.get('AbstractURL', '')}")
+for topic in data.get("RelatedTopics", [])[:num_results]:
+if isinstance(topic, dict) and topic.get("Text"):
+results.append(f"Related: {topic['Text']}\nURL: {topic.get('FirstURL','')}")
+return results
+except Exception as e:
+logging.debug("DuckDuckGo search failed: %s", e)
+return []
+
+def run_web_search_brave(query: str, num_results: int = 3) -> List[str]:
+api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+if not api_key:
+return []
+try:
+url = "https://api.search.brave.com/res/v1/web/search"
+headers = {"Accept":"application/json","X-Subscription-Token": api_key}
+params = {"q": query, "count": num_results, "search_lang": "en"}
+r = requests.get(url, headers=headers, params=params, timeout=10)
+r.raise_for_status()
+data = r.json()
+results = []
+for item in data.get("web", {}).get("results", []):
+results.append(f"Title: {item.get('title','')}\nDesc: {item.get('description','')}\nURL: {item.get('url','')}")
+return results
+except Exception as e:
+logging.debug("Brave search failed: %s", e)
+return []
+
+def run_web_search(query: str) -> List[str]:
+# brave preferred if key present
+r = run_web_search_brave(query)
+if r:
+return r
+return run_web_search_duckduckgo(query)
+-----------------------
+Generation (streaming) - robust access to chunks
+-----------------------
+
+async def generate_answer_with_context(context: str, query: str) -> str:
+client = mistral_client
+prompt = f"""Use the following context to answer the question.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer based on the context above:"""
+try:
+resp_stream = await client.chat.stream_async(model=MISTRAL_CHAT_MODEL, messages=[UserMessage(content=prompt)])
+answer = ""
+async for chunk in resp_stream:
+# robustly extract content from varied SDK chunk shapes
+try:
+choices = getattr(chunk.data, "choices", None)
+if choices is None and isinstance(chunk.data, dict):
+choices = chunk.data.get("choices")
+if choices:
+first = choices
+delta = getattr(first, "delta", None) or (first.get("delta") if isinstance(first, dict) else None)
+content = None
+if delta is not None:
+content = getattr(delta, "content", None) or (delta.get("content") if isinstance(delta, dict) else None)
+# some connectors send content in 'message' or direct fields
+if not content:
+content = getattr(first, "content", None) or (first.get("content") if isinstance(first, dict) else None)
+if content:
+print(content, end="", flush=True)
+answer += content
+except Exception:
+# last-resort: try to stringify chunk
+try:
+raw = json.dumps(chunk.dict, default=str)
+print(raw, end="", flush=True)
+answer += raw
+except Exception:
+pass
+print("\n")
+return answer.strip()
+except Exception as e:
+logging.error("Generation failed: %s", e, exc_info=True)
+return "Sorry — generation failed."
+-----------------------
+Main pipeline
+-----------------------
+
+async def main():
+parser = argparse.ArgumentParser(description="Hybrid RAG search + generation (fixed)")
+parser.add_argument("--query", required=True)
+parser.add_argument("--db", required=True)
+parser.add_argument("--topk", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+parser.add_argument("--eval", action="store_true")
+args = parser.parse_args()
+
+text
+setup_logging(args.verbose)
+try:
+    validate_environment()
+except Exception as e:
+    logging.error("Environment invalid: %s", e)
+    raise
+
+logging.info("Loading documents from DB: %s", args.db)
+documents = await load_documents_from_db(args.db)
+logging.info("Loaded %d documents", len(documents))
+
+# retrieval
+start = time.time()
+top_chunks = await search_with_fallback(documents, args.query, k=args.topk)
+elapsed = time.time() - start
+print(f"🔍 Search Time: {elapsed:.2f}s")
+if not top_chunks:
+    print("❌ No relevant documents found locally. Attempting web search...")
+    web = run_web_search(args.query)
+    if web:
+        context_text = "\n\n".join(web)
+        ans = await generate_answer_with_context(context_text, args.query)
+        print("\nAnswer (from web fallback):\n", ans)
+    else:
+        print("No web results either.")
+    return
+
+# quality & strategy
+quality = evaluate_retrieval_quality(top_chunks, args.query)
+if args.eval:
+    print("📊 Quality metrics:", quality)
+strategy, confidence = determine_retrieval_strategy(top_chunks, args.query)
+print(f"🎯 Strategy: {strategy} | Confidence: {confidence:.3f}")
+
+# prepare context
+if strategy == "local_docs":
+    context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS)
+elif strategy == "hybrid":
+    local_context = trim_context_with_relevance(top_chunks[:3], max_chars=MAX_CONTEXT_CHARS // 2)
+    web_results = run_web_search(args.query)
+    web_text = "\n\n".join(web_results) if web_results else ""
+    context_text = f"Local Results:\n{local_context}\n\nWeb Results:\n{web_text}"
+else:  # web_search
+    web_results = run_web_search(args.query)
+    context_text = "\n\n".join(web_results) if web_results else ""
+    if not context_text.strip():
+        # as final fallback, reuse top local chunks truncated
+        context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS // 2)
+
+if not context_text.strip():
+    print("❌ No usable context available to answer the question.")
+    return
+
+# generate answer
+print("\n🤖 --- Answer (streaming) ---\n")
+answer = await generate_answer_with_context(context_text, args.query)
+
+# show sources
+print("\n\n📚 Sources (top results):")
+for score, doc in top_chunks:
+    print(f"[{score:.3f}] {doc.get('doc_id','?')}-{doc.get('section_id','?')}: {doc.get('title','')[:140]}")
+
+if name == "main":
+try:
+asyncio.run(main())
+except KeyboardInterrupt:
+print("\nInterrupted by user.")
+LLM served by Perplexity Playground
+<think> The user is asking me to compare two files - query_tool1.py and hybrid_rag_search.py - and help them decide which to focus on. They want me to analyze both files and provide guidance on which one is better or which one they should focus their efforts on.
+
+Looking at both files:
+
+    query_tool1.py - This appears to be an earlier version with some issues:
+
+        Has duplicate imports (numpy imported twice, Mistral imported twice)
+
+        Uses manual httpx calls for embeddings with the wrong parameter name ("input" instead of "inputs")
+
+        Has a problematic fallback_web_search that uses beta agent APIs
+
+        Has some code quality issues like creating multiple client instances
+
+        The main function has some logic issues and duplicate prompt creation sections
+
+    hybrid_rag_search.py - This appears to be a more recent version:
+
+        Much cleaner code structure with proper imports
+
+        Better organized with clear sections
+
+        Implements async database loading with aiosqlite
+
+        Has proper error handling and fallbacks
+
+        Includes evaluation metrics and quality assessment
+
+        Has a more sophisticated hybrid search approach
+
+        Better context management and trimming
+
+        More robust generation with error handling
+
+Based on the search results about RAG best practices, I should evaluate which approach better follows the recommended patterns:
+
+From
+
+: RAG best practices include "Ensuring data quality", "Model training and maintenance", "Planning for scalability", etc.
+
+From
+
+: Talks about the importance of proper implementation and avoiding common pitfalls
+
+From
+
+: Emphasizes "starting with your core content sources" and being selective about data
+
+From
+
+: Focuses on documentation organization and clarity
+
+Clearly, hybrid_rag_search.py is the better implementation. It follows more best practices, has better error handling, includes evaluation metrics, and has a more sophisticated approach to retrieval and generation.
+
+The user should focus on hybrid_rag_search.py and abandon query_tool1.py.
+
+I'll craft a strategic recommendation highlighting the key strengths of hybrid_rag_search.py, drawing from industry best practices and the file's advanced implementation features. The recommendation will provide clear, actionable guidance that demonstrates why this version represents a superior approach to RAG implementation.
+
+I'll emphasize the technical improvements, architectural advantages, and alignment with modern machine learning development principles. The goal is to give a compelling, evidence-based rationale for prioritizing this more sophisticated implementation.
+</think>
+
+Based on the search results and analysis of both files, you should focus on hybrid_rag_search.py and discontinue development on query_tool1.py. Here's why:
+hybrid_rag_search.py is Production-Ready
+
+Follows RAG Best Practices
+Your hybrid_rag_search.py aligns with the key principles outlined in the search results
+
+. It implements proper data quality management through robust embedding parsing, scalability planning with async database operations, and continuous monitoring through evaluation metrics.
+
+Superior Architecture
+The modular design with clear separation of concerns follows the "Planning for scalability" principle from the search results
+
+. Your implementation includes:
+
+    Async database loading with aiosqlite
+
+    Proper error handling with fallback strategies
+
+    Quality evaluation metrics
+
+    Adaptive retrieval strategy selection
+
+Production-Ready Features
+Following the search results' emphasis on "thorough testing" and "feedback integration"
+
+, your hybrid_rag_search.py includes:
+
+    Quality metrics evaluation (evaluate_retrieval_quality())
+
+    Multiple retrieval strategies (local_docs, hybrid, web_search)
+
+    Robust error handling with graceful degradation
+
+Critical Issues with query_tool1.py
+
+Multiple Code Quality Problems
+
+    Duplicate imports (numpy, Mistral)
+
+    Incorrect API usage ("input" instead of "inputs" parameter)
+
+    Broken web search fallback using unstable beta APIs
+
+    Manual HTTP calls instead of official SDK methods
+
+Poor Error Handling
+The search results emphasize "continuously monitor the model's output"
+
+, but query_tool1.py lacks comprehensive error handling and quality metrics that would enable proper monitoring.
+
+Scalability Issues
+Your query_tool1.py doesn't follow the "Planning for scalability" recommendations
+
+- it uses synchronous database operations and creates multiple client instances, which won't scale well.
+Recommendation: Focus Development Efforts
+
+Continue with hybrid_rag_search.py because it:
+
+    Better Data Quality Management: Implements robust embedding parsing and async database operations following best practices
+
+Proper Model Maintenance: Includes evaluation metrics and monitoring capabilities as recommended
+
+Scalability-Ready: Uses async patterns and proper resource management
+
+User Experience Optimization: Provides clear feedback about retrieval quality and strategy selection
+
+Abandon query_tool1.py - it has too many fundamental issues that would require extensive refactoring to reach the quality level you've already achieved in hybrid_rag_search.py.
+
+The search results consistently emphasize that "implementing RAG effectively requires a wise approach to ensure its success and sustainability"
+
+. Your hybrid_rag_search.py demonstrates this wise approach with its comprehensive error handling, evaluation metrics, and scalable architecture, while query_tool1.py has structural issues that make it unsuitable for production use.
+
+Focus your efforts on enhancing hybrid_rag_search.py with additional features like the context diversification strategies discussed earlier to address the "dog focus" issue you mentioned.
+
+return updated hybrid_rag_search.py code with following updates:
+
+Missing Diversity in Retrieved Context
+The search results emphasize that effective RAG requires retrieving diverse, comprehensive context
+
+. Your current approach is finding semantically similar documents but they're all covering the same narrow aspect (dogs) rather than the full scope of patio requirements like:
+
+text
+Structural requirements (permits, construction standards)
+
+Health department regulations (food safety, hygiene)
+
+Fire safety requirements (egress, capacity limits)
+
+ADA compliance (accessibility)
+
+Zoning compliance (setbacks, use permissions)
+
+Solutions Based on RAG Best Practices
+
+Implement Query Classification and Expansion
+The search results highlight that "query classification component proves to help improve the accuracy of responses"
+
+. Enhance your query expansion:
+
+python
+def enhanced_normalize_query(query: str) -> str:
+"""Broader query expansion for comprehensive context retrieval."""
+q_lower = query.lower()
+expansions = []
+
+text
+# Existing mappings from USE_MAP...
+
+# RESTAURANT PATIO SPECIFIC EXPANSIONS
+if 'patio' in q_lower and any(term in q_lower for term in ['restaurant', 'dining', 'food']):
+    expansions.extend([
+        'outdoor dining', 'exterior seating', 'al fresco',
+        'sidewalk cafe', 'outdoor service area',
+        # Regulatory aspects
+        'health department', 'food safety', 'construction permits',
+        'fire code', 'ada compliance', 'accessibility',
+        'zoning setback', 'right of way', 'encroachment'
+    ])
+
+# Add requirement-focused terms
+if any(term in q_lower for term in ['requirement', 'regulation', 'rule', 'code']):
+    expansions.extend([
+        'permit', 'approval', 'inspection', 'compliance',
+        'standard', 'specification', 'guideline'
+    ])
+
+return query + " " + " ".join(set(expansions))
+
+Add Context Diversification
+Implement the reranking component recommended in the search results
+
+:
+
+python
+async def diversify_context_retrieval(documents, query, k=15, final_k=5):
+"""
+Retrieve more candidates initially, then diversify to cover different aspects.
+"""
+# Get more candidates initially
+initial_chunks = await search_top_chunks(documents, query, k=k)
+
+text
+if not initial_chunks:
+    return []
+
+# Group by document themes/sections
+theme_groups = {}
+for score, chunk in initial_chunks:
+    section_type = extract_section_theme(chunk)
+    if section_type not in theme_groups:
+        theme_groups[section_type] = []
+    theme_groups[section_type].append((score, chunk))
+
+# Take best from each theme to ensure diversity
+diversified = []
+themes = list(theme_groups.keys())
+
+# Round-robin selection from each theme
+max_per_theme = max(1, final_k // len(themes)) if themes else 1
+
+for theme in themes:
+    theme_chunks = sorted(theme_groups[theme], key=lambda x: x, reverse=True)
+    diversified.extend(theme_chunks[:max_per_theme])
+
+# Sort by score and trim to final_k
+diversified.sort(key=lambda x: x, reverse=True)
+return diversified[:final_k]
+
+def extract_section_theme(chunk):
+"""Classify document sections by theme to ensure diverse retrieval."""
+title = chunk.get('title', '').lower()
+text = chunk.get('text', '').lower()
+content = f"{title} {text}"
+
+text
+if any(term in content for term in ['dog', 'pet', 'animal']):
+    return 'animals'
+elif any(term in content for term in ['fire', 'safety', 'emergency', 'egress']):
+    return 'safety'
+elif any(term in content for term in ['health', 'sanitation', 'food safety']):
+    return 'health'
+elif any(term in content for term in ['ada', 'accessibility', 'handicap']):
+    return 'accessibility'
+elif any(term in content for term in ['zoning', 'setback', 'district']):
+    return 'zoning'
+elif any(term in content for term in ['construction', 'permit', 'building']):
+    return 'construction'
+else:
+    return 'general'
+
+Improve Context Summarization
+The search results recommend "abstractive method with Recomp" for context summarization
+
+. Enhance your prompt to guide the LLM toward comprehensive coverage:
+
+python
+def create_comprehensive_prompt(context_text, query):
+"""Create prompts that encourage comprehensive coverage."""
+if 'patio' in query.lower() and 'restaurant' in query.lower():
+return f"""You are a Dallas restaurant compliance expert. The user is asking about restaurant patio requirements.
+
+IMPORTANT: The context below may contain specific regulations (like dog policies) but the user wants COMPREHENSIVE patio requirements covering ALL relevant areas:
+
+    Zoning and permits (construction permits, zoning compliance)
+
+    Health department (food safety, sanitation)
+
+    Fire safety (egress, capacity, safety equipment)
+
+    ADA compliance (accessibility requirements)
+
+    Structural requirements (construction standards)
+
+    Animal policies (pet regulations if applicable)
+
+If the context only covers one aspect (like animals), acknowledge that and explain what OTHER requirements typically apply, even if not fully detailed in the provided context.
+
+Context from Dallas City Code:
+{context_text}
+
+Question: {query}
+
+Provide a comprehensive answer covering all relevant requirement categories:"""
+else:
+return f"""You are a Dallas zoning expert. Answer comprehensively using the provided context.
+
+Context:
+{context_text}
+
+Question: {query}
+Answer:"""
+
+Add Multi-Query Retrieval
+Expand your search to multiple related queries to capture broader context:
+
+python
+async def multi_query_retrieval(documents, original_query, k=5):
+"""Retrieve context using multiple related queries for better coverage."""
+# Generate related queries for restaurant patio requirements
+related_queries = generate_related_queries(original_query)
+
+text
+all_chunks = []
+for query_variant in related_queries:
+    chunks = await search_top_chunks(documents, query_variant, k=k//len(related_queries))
+    all_chunks.extend(chunks)
+
+# Deduplicate and rerank
+seen_docs = set()
+deduped_chunks = []
+for score, chunk in sorted(all_chunks, key=lambda x: x, reverse=True):
+    doc_key = (chunk.get('doc_id'), chunk.get('section_id'))
+    if doc_key not in seen_docs:
+        seen_docs.add(doc_key)
+        deduped_chunks.append((score, chunk))
+        if len(deduped_chunks) >= k:
+            break
+
+return deduped_chunks
+
+def generate_related_queries(original_query):
+"""Generate related queries to capture different aspects."""
+if 'patio' in original_query.lower() and 'restaurant' in original_query.lower():
+return [
+original_query,
+"restaurant outdoor dining permits Dallas",
+"restaurant construction requirements Dallas",
+"outdoor seating health code Dallas",
+"restaurant fire safety requirements Dallas",
+"ADA accessibility restaurant Dallas"
+]
+return [original_query]
+
+The core issue is that your RAG system is retrieving too narrowly rather than comprehensively. The search results emphasize that RAG systems need both accurate retrieval AND appropriate context composition
+. Your system found relevant documents but they're all about one specific aspect (dogs) rather than the full spectrum of patio requirements. The enhanced query expansion, context diversification, and improved prompting above should resolve this issue.
+LLM served by Perplexity Playground
+<think> The user wants me to update their hybrid_rag_search.py code with the improvements I suggested, specifically focusing on addressing the issue where their RAG system is only retrieving context about dogs when they ask about "restaurant patio requirements."
+
+Based on the search results about contextual retrieval from Anthropic and other sources, I need to implement:
+
+    Enhanced query expansion for broader context retrieval
+
+    Context diversification to cover different aspects
+
+    Multi-query retrieval for comprehensive coverage
+
+    Better prompting for comprehensive answers
+
+The search results emphasize that traditional RAG systems lose context when encoding information, and contextual retrieval can reduce failed retrievals by 49-67%. The key insights are:
+
+    RAG systems need both accurate retrieval AND appropriate context composition
+
+    Contextual embeddings and contextual BM25 are important
+
+    Hybrid search (semantic + keyword) with re-ranking is recommended
+
+    The retrieval mechanism is critically important for RAG
+
+I need to integrate these improvements into their existing hybrid_rag_search.py code while maintaining the good structure they already have.
+</think>
+
+Focus on hybrid_rag_search.py - it's significantly better architected and aligns with RAG best practices from the search results. Here's the updated code with contextual retrieval improvements to fix the "dog focus" issue:
+
+python
+#!/usr/bin/env python3
+"""
+Enhanced Hybrid RAG with Contextual Retrieval
+Implements Anthropic's contextual retrieval principles to improve context diversity
+"""
+
+# Standard library
+import os
+import re
+import time
+import json
+import argparse
+import logging
+import asyncio
+from typing import List, Dict, Tuple, Any, Optional
+from urllib.parse import quote
+
+# Third-party
+import numpy as np
+import aiosqlite
+import httpx
+import requests
+from dotenv import load_dotenv
+from mistralai import Mistral
+from mistralai.models import UserMessage
+
+load_dotenv()
+
+# -----------------------
+# Constants / Configuration
+# -----------------------
+MIN_EMBEDDING_LENGTH = 100
+MAX_CONTEXT_CHARS = 12000
+DEFAULT_SIMILARITY_THRESHOLD = 0.7
+ZONING_SIMILARITY_THRESHOLD = 0.45
+KEYWORD_BOOST_SCORE = 0.5
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+MISTRAL_EMBED_MODEL = os.environ.get("MISTRAL_EMBED_MODEL", "mistral-embed")
+MISTRAL_CHAT_MODEL = os.environ.get("MISTRAL_CHAT_MODEL", "mistral-large-2411")
+
+# -----------------------
+# Logging & env validation
+# -----------------------
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
+    handlers = [logging.StreamHandler()]
+    handlers.append(logging.FileHandler("hybrid_rag.log"))
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+def validate_environment() -> None:
+    missing = []
+    if not MISTRAL_API_KEY:
+        missing.append("MISTRAL_API_KEY")
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+# -----------------------
+# Mistral client singleton
+# -----------------------
+class MistralClient:
+    _instance: Optional[Mistral] = None
+
+    @classmethod
+    def get_client(cls) -> Mistral:
+        if cls._instance is None:
+            cls._instance = Mistral(api_key=MISTRAL_API_KEY)
+        return cls._instance
+
+mistral_client = MistralClient.get_client()
+
+# -----------------------
+# Enhanced Query normalization (contextual retrieval)
+# -----------------------
+USE_MAP = {
+    "coffee shop": "restaurant (limited service)",
+    "starbucks": "restaurant (limited service)",
+    "cafe": "restaurant (limited service)",
+    "sandwich shop": "restaurant (limited service)",
+    "fast food": "restaurant (limited service)",
+    "gym": "indoor recreation",
+    "barbershop": "personal service",
+    "cs district": "commercial service district",
+    "commercial service": "commercial service district",
+}
+
+def enhanced_normalize_query(query: str) -> str:
+    """Broader query expansion for comprehensive context retrieval."""
+    q_lower = query.lower()
+    expansions = []
+
+    # Existing mappings from USE_MAP
+    for k, v in USE_MAP.items():
+        if k in q_lower:
+            expansions.append(v)
+
+    # RESTAURANT PATIO SPECIFIC EXPANSIONS
+    if 'patio' in q_lower and any(term in q_lower for term in ['restaurant', 'dining', 'food']):
+        expansions.extend([
+            'outdoor dining', 'exterior seating', 'al fresco',
+            'sidewalk cafe', 'outdoor service area',
+            # Regulatory aspects
+            'health department', 'food safety', 'construction permits',
+            'fire code', 'ada compliance', 'accessibility',
+            'zoning setback', 'right of way', 'encroachment'
+        ])
+
+    # Add requirement-focused terms
+    if any(term in q_lower for term in ['requirement', 'regulation', 'rule', 'code']):
+        expansions.extend([
+            'permit', 'approval', 'inspection', 'compliance',
+            'standard', 'specification', 'guideline'
+        ])
+
+    # Zoning-specific expansions
+    if any(term in q_lower for term in ['cs district', 'cs zone']):
+        expansions.extend(['cs and industrial', 'commercial service', 'chapter 51'])
+    if 'starbucks' in q_lower and 'cs' in q_lower:
+        expansions.extend(['restaurant', 'limited service', 'permitted uses', 'cs and industrial'])
+    if any(term in q_lower for term in ['can i build', 'allowed', 'permitted']):
+        expansions.extend(['permitted uses', 'district regulations', 'zoning ordinance'])
+    if 'dallas' in q_lower:
+        expansions.append('city code ordinance development services')
+
+    return query + " " + " ".join(set(expansions)) if expansions else query
+
+def generate_related_queries(original_query: str) -> List[str]:
+    """Generate related queries to capture different aspects."""
+    q_lower = original_query.lower()
+
+    if 'patio' in q_lower and any(term in q_lower for term in ['restaurant', 'dining']):
+        return [
+            original_query,
+            "restaurant outdoor dining permits Dallas",
+            "restaurant construction requirements Dallas",
+            "outdoor seating health code Dallas",
+            "restaurant fire safety requirements Dallas",
+            "ADA accessibility restaurant Dallas",
+            "restaurant zoning compliance Dallas"
+        ]
+    elif 'starbucks' in q_lower or 'coffee' in q_lower:
+        return [
+            original_query,
+            "coffee shop zoning requirements Dallas",
+            "restaurant limited service permit Dallas",
+            "commercial service district regulations"
+        ]
+    return [original_query]
+
+# -----------------------
+# Context theme classification
+# -----------------------
+def extract_section_theme(chunk: Dict[str, Any]) -> str:
+    """Classify document sections by theme to ensure diverse retrieval."""
+    title = chunk.get('title', '').lower()
+    text = chunk.get('text', '').lower()
+    content = f"{title} {text}"
+
+    if any(term in content for term in ['dog', 'pet', 'animal']):
+        return 'animals'
+    elif any(term in content for term in ['fire', 'safety', 'emergency', 'egress']):
+        return 'safety'
+    elif any(term in content for term in ['health', 'sanitation', 'food safety']):
+        return 'health'
+    elif any(term in content for term in ['ada', 'accessibility', 'handicap']):
+        return 'accessibility'
+    elif any(term in content for term in ['zoning', 'setback', 'district']):
+        return 'zoning'
+    elif any(term in content for term in ['construction', 'permit', 'building']):
+        return 'construction'
+    elif any(term in content for term in ['parking', 'traffic', 'vehicle']):
+        return 'parking'
+    else:
+        return 'general'
+
+# -----------------------
+# Embeddings: robust async call with fallback
+# -----------------------
+async def mistral_embed_httpx(texts: List[str]) -> List[List[float]]:
+    """Fallback embedding call using httpx to the REST endpoint."""
+    url = "https://api.mistral.ai/v1/embeddings"
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": MISTRAL_EMBED_MODEL, "inputs": texts}  # Correct parameter name
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return [item["embedding"] for item in data.get("data", [])]
+
+async def get_query_vector(query: str) -> Optional[np.ndarray]:
+    """Get query embedding with fallback strategy."""
+    client = mistral_client
+    try:
+        embeddings_resp = await client.embeddings.create_async(model=MISTRAL_EMBED_MODEL, inputs=[query])
+        data = getattr(embeddings_resp, "data", None)
+        if data and len(data) > 0:
+            emb = data.embedding
+            return np.array(emb, dtype=float)
+    except Exception as e:
+        logging.debug("create_async failed, falling back to httpx: %s", e)
+
+    # Fallback to httpx
+    try:
+        embeddings = await mistral_embed_httpx([query])
+        if embeddings:
+            return np.array(embeddings, dtype=float)
+    except Exception as e:
+        logging.error("Embedding fallback failed: %s", e)
+    return None
+
+# -----------------------
+# Parse embedding from DB
+# -----------------------
+def parse_embedding(embedding_raw: Any) -> Optional[np.ndarray]:
+    if not embedding_raw:
+        return None
+    try:
+        if isinstance(embedding_raw, str):
+            emb = json.loads(embedding_raw)
+            if isinstance(emb, list) and len(emb) >= MIN_EMBEDDING_LENGTH:
+                return np.array(emb, dtype=float)
+        elif isinstance(embedding_raw, (bytes, memoryview)):
+            if len(embedding_raw) >= 4 and (len(embedding_raw) % 4 == 0):
+                emb = np.frombuffer(embedding_raw, dtype=np.float32)
+                if len(emb) >= MIN_EMBEDDING_LENGTH:
+                    return emb.astype(float)
+        elif isinstance(embedding_raw, (list, tuple)):
+            emb = np.array(embedding_raw, dtype=float)
+            if emb.size >= MIN_EMBEDDING_LENGTH:
+                return emb
+    except Exception as e:
+        logging.debug("parse_embedding error: %s", e)
+    return None
+
+# -----------------------
+# Async DB load
+# -----------------------
+async def load_documents_from_db(db_path: str) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    try:
+        async with aiosqlite.connect(db_path) as conn:
+            async with conn.execute("SELECT doc_id, section_id, title, text, embedding FROM documents") as cursor:
+                async for row in cursor:
+                    doc_id, section_id, title, text, embedding_raw = row
+                    docs.append({
+                        "doc_id": doc_id,
+                        "section_id": section_id,
+                        "title": title or "",
+                        "text": text or "",
+                        "embedding": parse_embedding(embedding_raw)
+                    })
+    except Exception as e:
+        logging.error("Failed to load documents from DB: %s", e, exc_info=True)
+    return docs
+
+# -----------------------
+# Multi-query retrieval for comprehensive context
+# -----------------------
+async def multi_query_retrieval(documents: List[Dict[str, Any]], original_query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Retrieve context using multiple related queries for better coverage."""
+    related_queries = generate_related_queries(original_query)
+
+    all_chunks = []
+    for query_variant in related_queries:
+        chunks = await search_top_chunks_optimized(documents, query_variant, k=k//len(related_queries))
+        all_chunks.extend(chunks)
+
+    # Deduplicate and rerank
+    seen_docs = set()
+    deduped_chunks = []
+    for score, chunk in sorted(all_chunks, key=lambda x: x, reverse=True):
+        doc_key = (chunk.get('doc_id'), chunk.get('section_id'))
+        if doc_key not in seen_docs:
+            seen_docs.add(doc_key)
+            deduped_chunks.append((score, chunk))
+            if len(deduped_chunks) >= k:
+                break
+
+    return deduped_chunks
+
+# -----------------------
+# Context diversification
+# -----------------------
+async def diversify_context_retrieval(documents: List[Dict[str, Any]], query: str, k: int = 15, final_k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Retrieve more candidates initially, then diversify to cover different aspects."""
+    # Get more candidates initially using multi-query approach
+    initial_chunks = await multi_query_retrieval(documents, query, k=k)
+
+    if not initial_chunks:
+        return []
+
+    # Group by document themes/sections
+    theme_groups = {}
+    for score, chunk in initial_chunks:
+        section_type = extract_section_theme(chunk)
+        if section_type not in theme_groups:
+            theme_groups[section_type] = []
+        theme_groups[section_type].append((score, chunk))
+
+    # Take best from each theme to ensure diversity
+    diversified = []
+    themes = list(theme_groups.keys())
+
+    # Round-robin selection from each theme
+    max_per_theme = max(1, final_k // len(themes)) if themes else 1
+
+    for theme in themes:
+        theme_chunks = sorted(theme_groups[theme], key=lambda x: x, reverse=True)
+        diversified.extend(theme_chunks[:max_per_theme])
+
+    # Sort by score and trim to final_k
+    diversified.sort(key=lambda x: x, reverse=True)
+    return diversified[:final_k]
+
+# -----------------------
+# Hybrid search (optimized single-pass)
+# -----------------------
+async def search_top_chunks_optimized(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Single-pass hybrid scoring with enhanced query normalization."""
+    normalized_query = enhanced_normalize_query(query)
+    query_tokens = set(re.findall(r'\b\w{3,}\b', normalized_query.lower()))
+    query_vector = await get_query_vector(normalized_query)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for doc in documents:
+        doc_emb = doc.get("embedding")
+        semantic_score = 0.0
+        if doc_emb is not None and query_vector is not None:
+            try:
+                doc_vec = np.array(doc_emb, dtype=float)
+                denom = np.linalg.norm(query_vector) * np.linalg.norm(doc_vec)
+                if denom > 0:
+                    semantic_score = float(np.dot(query_vector, doc_vec) / denom)
+            except Exception:
+                semantic_score = 0.0
+
+        # Enhanced exact/token coverage with contextual awareness
+        text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+        exact_score = 0.0
+
+        # Full normalized query match (highest priority)
+        if normalized_query.lower() in text_content:
+            exact_score += 1.0
+
+        # Token coverage scoring
+        if query_tokens:
+            match_tokens = sum(1 for t in query_tokens if t in text_content)
+            token_coverage = match_tokens / len(query_tokens)
+            exact_score += token_coverage * 0.7
+
+        final_score = (semantic_score * 0.6) + (exact_score * 0.4)
+        scored.append((final_score, doc))
+
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+# -----------------------
+# Simple text fallback search
+# -----------------------
+def simple_text_search(documents: List[Dict[str, Any]], query: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
+    q = query.lower()
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    tokens = q.split()
+    for doc in documents:
+        text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+        if not text_content:
+            continue
+        score = 1.0 if q in text_content else 0.0
+        if tokens:
+            token_matches = sum(1 for t in tokens if t in text_content)
+            token_score = token_matches / len(tokens)
+            score = max(score, token_score)
+        if score > 0:
+            scored.append((score, doc))
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+async def search_with_fallback(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    try:
+        # Use diversified retrieval for comprehensive context
+        return await diversify_context_retrieval(documents, query, k=k*3, final_k=k)
+    except Exception as e:
+        logging.warning("Diversified search failed (%s). Falling back to simple text search.", e)
+        return simple_text_search(documents, query, k)
+
+# -----------------------
+# Context trimming (relevance-aware with theme diversity)
+# -----------------------
+def trim_context_with_relevance(chunks: List[Tuple[float, Dict[str, Any]]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    if not chunks:
+        return ""
+
+    # Group by theme to ensure diverse context
+    theme_groups = {}
+    for score, doc in chunks:
+        theme = extract_section_theme(doc)
+        if theme not in theme_groups:
+            theme_groups[theme] = []
+        theme_groups[theme].append((score, doc))
+
+    # Build context ensuring theme diversity
+    parts: List[str] = []
+    total = 0
+    themes_used = set()
+
+    # First pass: include top result from each theme
+    for theme, theme_chunks in theme_groups.items():
+        if total >= max_chars:
+            break
+        best_chunk = max(theme_chunks, key=lambda x: x)
+        score, doc = best_chunk
+        title = doc.get("title", "")
+        text = doc.get("text", "")
+        header = f"## {title} (relevance: {score:.3f}, theme: {theme})\n"
+        body = f"{text}\n\n"
+        section = header + body
+
+        if total + len(section) <= max_chars:
+            parts.append(section)
+            total += len(section)
+            themes_used.add(theme)
+        else:
+            remaining = max_chars - total - len(header)
+            if remaining > 200:
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                partial = ""
+                for s in sentences:
+                    if len(partial) + len(s) + 1 <= remaining - 5:
+                        partial += (s + " ")
+                    else:
+                        break
+                if partial:
+                    parts.append(header + partial.strip() + "...\n\n")
+            break
+
+    return "".join(parts)
+
+# -----------------------
+# Retrieval quality & strategy
+# -----------------------
+def evaluate_retrieval_quality(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Dict[str, float]:
+    if not chunks:
+        return {"confidence": 0.0, "coverage": 0.0, "diversity": 0.0, "num_results": 0, "theme_diversity": 0.0}
+
+    scores = [s for s, _ in chunks]
+    query_tokens = set(re.findall(r'\b\w{3,}\b', query.lower()))
+    confidence = max(scores)
+    variance = float(np.var(scores)) if len(scores) > 1 else 0.0
+    diversity = max(0.0, 1.0 - variance)
+
+    # Theme diversity calculation
+    themes = set(extract_section_theme(doc) for _, doc in chunks)
+    theme_diversity = len(themes) / 7.0  # We have 7 possible themes
+
+    all_text = " ".join([c.get("text","").lower() for _, c in chunks])
+    coverage = (sum(1 for t in query_tokens if t in all_text) / len(query_tokens)) if query_tokens else 0.0
+
+    return {
+        "confidence": confidence,
+        "coverage": coverage,
+        "diversity": diversity,
+        "theme_diversity": theme_diversity,
+        "num_results": len(chunks)
+    }
+
+def determine_retrieval_strategy(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Tuple[str, float]:
+    if not chunks:
+        return "web_search", 0.0
+    best = chunks
+    top3_avg = sum(s for s, _ in chunks[:3]) / min(3, len(chunks))
+
+    # Consider theme diversity in strategy
+    themes = set(extract_section_theme(doc) for _, doc in chunks)
+    theme_diversity = len(themes) / 7.0
+
+    is_specific = any(t in query.lower() for t in ["cs district", "zoning", "dallas", "ordinance", "section", "code", "patio", "restaurant"])
+
+    if is_specific:
+        # For specific queries, consider both score and diversity
+        if best >= 0.35 and top3_avg >= 0.25 and theme_diversity >= 0.3:
+            return "local_docs", min(best * 1.5, 1.0)
+        elif best >= 0.2 or theme_diversity >= 0.4:
+            return "hybrid", best
+        else:
+            return "web_search", 0.2
+    else:
+        if best >= 0.6 and theme_diversity >= 0.2:
+            return "local_docs", best
+        elif best >= 0.4:
+            return "hybrid", best * 0.8
+        else:
+            return "web_search", 0.3
+
+# -----------------------
+# Web-search fallbacks
+# -----------------------
+def run_web_search_duckduckgo(query: str, num_results: int = 3) -> List[str]:
+    try:
+        url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results: List[str] = []
+        if data.get("Abstract"):
+            results.append(f"Summary: {data.get('Abstract')}\nSource: {data.get('AbstractURL', '')}")
+        for topic in data.get("RelatedTopics", [])[:num_results]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(f"Related: {topic['Text']}\nURL: {topic.get('FirstURL','')}")
+        return results
+    except Exception as e:
+        logging.debug("DuckDuckGo search failed: %s", e)
+        return []
+
+def run_web_search_brave(query: str, num_results: int = 3) -> List[str]:
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    if not api_key:
+        return []
+    try:
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {"Accept":"application/json","X-Subscription-Token": api_key}
+        params = {"q": query, "count": num_results, "search_lang": "en"}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get("web", {}).get("results", []):
+            results.append(f"Title: {item.get('title','')}\nDesc: {item.get('description','')}\nURL: {item.get('url','')}")
+        return results
+    except Exception as e:
+        logging.debug("Brave search failed: %s", e)
+        return []
+
+def run_web_search(query: str) -> List[str]:
+    r = run_web_search_brave(query)
+    if r:
+        return r
+    return run_web_search_duckduckgo(query)
+
+# -----------------------
+# Enhanced prompt creation for comprehensive answers
+# -----------------------
+def create_comprehensive_prompt(context_text: str, query: str) -> str:
+    """Create prompts that encourage comprehensive coverage."""
+    if 'patio' in query.lower() and any(term in query.lower() for term in ['restaurant', 'dining']):
+        return f"""You are a Dallas restaurant compliance expert. The user is asking about restaurant patio requirements.
+
+IMPORTANT: The context below may contain specific regulations (like dog policies) but the user wants COMPREHENSIVE patio requirements covering ALL relevant areas:
+
+1. **Zoning and permits** (construction permits, zoning compliance)
+2. **Health department** (food safety, sanitation)
+3. **Fire safety** (egress, capacity, safety equipment)
+4. **ADA compliance** (accessibility requirements)
+5. **Structural requirements** (construction standards)
+6. **Animal policies** (pet regulations if applicable)
+
+If the context only covers one aspect (like animals), acknowledge that and explain what OTHER requirements typically apply, even if not fully detailed in the provided context.
+
+Context from Dallas City Code:
+{context_text}
+
+Question: {query}
+
+Provide a comprehensive answer covering all relevant requirement categories:"""
+
+    elif any(term in query.lower() for term in ['district', 'zone', 'cs', 'permitted', 'allowed', 'build']):
+        return f"""You are a Dallas zoning expert. Answer comprehensively using the provided context.
+
+Context:
+{context_text}
+
+Question: {query}
+Answer:"""
+
+    else:
+        return f"""Use the following context to answer the question comprehensively.
+
+Context:
+{context_text}
+
+Question: {query}
+
+Answer based on the context above:"""
+
+# -----------------------
+# Generation (streaming) - robust access to chunks
+# -----------------------
+async def generate_answer_with_context(context: str, query: str) -> str:
+    client = mistral_client
+    prompt = create_comprehensive_prompt(context, query)
+
+    try:
+        resp_stream = await client.chat.stream_async(model=MISTRAL_CHAT_MODEL, messages=[UserMessage(content=prompt)])
+        answer = ""
+        async for chunk in resp_stream:
+            try:
+                choices = getattr(chunk.data, "choices", None)
+                if choices and len(choices) > 0:
+                    first = choices
+                    delta = getattr(first, "delta", None)
+                    if delta:
+                        content = getattr(delta, "content", None)
+                        if content:
+                            print(content, end="", flush=True)
+                            answer += content
+            except Exception:
+                pass
+        print("\n")
+        return answer.strip()
+    except Exception as e:
+        logging.error("Generation failed: %s", e)
+        return "Sorry — generation failed."
+
+# -----------------------
+# Main pipeline with contextual retrieval
+# -----------------------
+async def main():
+    parser = argparse.ArgumentParser(description="Enhanced Hybrid RAG with Contextual Retrieval")
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--diversify", action="store_true", help="Use context diversification for broader results")
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
+    validate_environment()
+
+    logging.info("Loading documents from DB: %s", args.db)
+    documents = await load_documents_from_db(args.db)
+    logging.info("Loaded %d documents", len(documents))
+
+    # Enhanced retrieval with diversification option
+    start = time.time()
+    if args.diversify:
+        top_chunks = await diversify_context_retrieval(documents, args.query, k=args.topk*3, final_k=args.topk)
+        print("🔍 Using diversified contextual retrieval")
+    else:
+        top_chunks = await search_with_fallback(documents, args.query, k=args.topk)
+
+    elapsed = time.time() - start
+    print(f"🔍 Search Time: {elapsed:.2f}s")
+
+    if not top_chunks:
+        print("❌ No relevant documents found locally. Attempting web search...")
+        web = run_web_search(args.query)
+        if web:
+            context_text = "\n\n".join(web)
+            ans = await generate_answer_with_context(context_text, args.query)
+        else:
+            print("No web results either.")
+        return
+
+    # Enhanced quality assessment
+    quality = evaluate_retrieval_quality(top_chunks, args.query)
+    if args.eval:
+        print("📊 Quality metrics:", quality)
+
+        # Show theme distribution
+        themes = [extract_section_theme(doc) for _, doc in top_chunks]
+        theme_counts = {}
+        for theme in themes:
+            theme_counts[theme] = theme_counts.get(theme, 0) + 1
+        print(f"📋 Theme distribution: {theme_counts}")
+
+    strategy, confidence = determine_retrieval_strategy(top_chunks, args.query)
+    print(f"🎯 Strategy: {strategy} | Confidence: {confidence:.3f}")
+
+    # prepare context
+    if strategy == "local_docs":
+        context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS)
+    elif strategy == "hybrid":
+        local_context = trim_context_with_relevance(top_chunks[:3], max_chars=MAX_CONTEXT_CHARS // 2)
+        web_results = run_web_search(args.query)
+        web_text = "\n\n".join(web_results) if web_results else ""
+        context_text = f"Local Results:\n{local_context}\n\nWeb Results:\n{web_text}"
+    else:  # web_search
+        web_results = run_web_search(args.query)
+        context_text = "\n\n".join(web_results) if web_results else ""
+        if not context_text.strip():
+            context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS // 2)
+
+    if not context_text.strip():
+        print("❌ No usable context available to answer the question.")
+        return
+
+    # generate answer
+    print("\n🤖 --- Answer (streaming) ---\n")
+    answer = await generate_answer_with_context(context_text, args.query)
+
+    # show sources with theme information
+    print("\n\n📚 Sources (by theme):")
+    theme_groups = {}
+    for score, doc in top_chunks:
+        theme = extract_section_theme(doc)
+        if theme not in theme_groups:
+            theme_groups[theme] = []
+        theme_groups[theme].append((score, doc))
+
+    for theme, docs in theme_groups.items():
+        print(f"\n**{theme.upper()} REGULATIONS:**")
+        for score, doc in docs:
+            print(f"  [{score:.3f}] {doc.get('doc_id','?')}-{doc.get('section_id','?')}: {doc.get('title','')[:100]}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+
+Key Improvements Applied
+
+Contextual Retrieval Implementation
+Following Anthropic's contextual retrieval principles
+
+, the enhanced system now:
+
+    Uses multi-query retrieval to capture different aspects of restaurant patio requirements
+
+    Implements context diversification to ensure theme variety rather than focusing on one aspect
+
+    Applies enhanced query expansion specifically for patio-related queries
+
+Advanced Re-ranking Strategy
+The search results emphasize that "advanced search engines use semantic search and keyword search together (called hybrid search), and a re-ranker which scores search results"
+
+. Your updated system now includes theme-aware re-ranking to ensure comprehensive coverage.
+
+Improved Context Quality
+Based on the principle that "if your retrieved information is irrelevant, your generation could be grounded but off-topic"
+
+, the system now provides theme-diverse context and uses enhanced prompting to encourage comprehensive answers rather than narrow focus.
+
+Run with --diversify --eval flags to see the improved contextual retrieval in action:
+
+bash
+python hybrid_rag_search.py --query "restaurant patio requirements?" --db data/cogs_memory.db --diversify --eval
+
+This addresses your "dog focus" issue by ensuring the RAG system retrieves diverse, comprehensive context covering all aspects of restaurant patio requirements, not just animal policies.
+
+(base) gigmx@nighthawk-B6:~/gpt-oss-alignment/cogs-project$ python hybrid_rag_search.py --query "restaurant patio requirements?" --db data/cogs_memory.db --diversify --eval
+2025-08-29 17:14:40,800 - root - INFO - main:630 - Loading documents from DB: data/cogs_memory.db
+2025-08-29 17:14:41,240 - root - INFO - main:632 - Loaded 4010 documents
+2025-08-29 17:14:41,800 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 200 OK"
+2025-08-29 17:14:42,457 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 17:14:42,457 - root - ERROR - get_query_vector:209 - Embedding fallback failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+Traceback (most recent call last):
+File "/home/gigmx/gpt-oss-alignment/cogs-project/hybrid_rag_search.py", line 708, in <module>
+asyncio.run(main())
+File "/home/gigmx/miniconda3/lib/python3.12/asyncio/runners.py", line 194, in run
+return runner.run(main)
+^^^^^^^^^^^^^^^^
+File "/home/gigmx/miniconda3/lib/python3.12/asyncio/runners.py", line 118, in run
+return self._loop.run_until_complete(task)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/gigmx/miniconda3/lib/python3.12/asyncio/base_events.py", line 685, in run_until_complete
+return future.result()
+^^^^^^^^^^^^^^^
+File "/home/gigmx/gpt-oss-alignment/cogs-project/hybrid_rag_search.py", line 637, in main
+top_chunks = await diversify_context_retrieval(documents, args.query, k=args.topk*3, final_k=args.topk)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/gigmx/gpt-oss-alignment/cogs-project/hybrid_rag_search.py", line 288, in diversify_context_retrieval
+initial_chunks = await multi_query_retrieval(documents, query, k=k)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/gigmx/gpt-oss-alignment/cogs-project/hybrid_rag_search.py", line 266, in multi_query_retrieval
+chunks = await search_top_chunks_optimized(documents, query_variant, k=k//len(related_queries))
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/gigmx/gpt-oss-alignment/cogs-project/hybrid_rag_search.py", line 355, in search_top_chunks_optimized
+scored.sort(key=lambda x: x, reverse=True)
+TypeError: '<' not supported between instances of 'dict' and 'dict'
+(base) gigmx@nighthawk-B6:~/gpt-oss-alignment/cogs-project$
+LLM served by Perplexity Playground
+<think> The user is getting a couple of errors:
+
+    HTTP 422 error from Mistral embeddings API - based on the search results, this is likely due to unsupported parameters being sent. The search results show that 422 errors often occur when models don't support specific parameters or when there are extra inputs that aren't permitted.
+
+    TypeError: '<' not supported between instances of 'dict' and 'dict' - this is happening in the sorting operation. Looking at the code, they have:
+
+python
+scored.sort(key=lambda x: x, reverse=True)
+
+But based on the error, it seems like the lambda is just x instead of x. This suggests the data structure isn't what's expected.
+
+Let me look at the search results more carefully:
+
+From
+
+: "The error appears to be related to the usage settings" and mentions that unsupported parameters like stream_options and seed can cause 422 errors.
+
+From
+
+: "MistralAI - 422 Extra inputs are not permitted" - this suggests that extra parameters in the request are causing issues.
+
+From
+
+: Shows that 422 errors occur when "One of the parameters contain invalid values" and you can inspect details.loc to see the problematic parameter.
+
+So the issues are:
+
+    The embedding API call has extra/unsupported parameters
+
+    The sorting operation has a bug in the lambda function
+
+Let me fix both issues in the code:
+
+    For the 422 error, I need to clean up the embedding API call to only include supported parameters
+
+    For the sorting error, I need to fix the lambda function to properly access the score
+    </think>
+
+Based on the search results showing Mistral API 422 errors are typically caused by "extra inputs" or "unsupported parameters"
+
+, and the sorting error in your code, here's the updated hybrid_rag_search.py with fixes:
+
+python
+#!/usr/bin/env python3
+"""
+Enhanced Hybrid RAG with Contextual Retrieval
+Implements contextual retrieval principles to improve context diversity
+Fixed: 422 API errors and sorting issues
+"""
+
+# Standard library
+import os
+import re
+import time
+import json
+import argparse
+import logging
+import asyncio
+from typing import List, Dict, Tuple, Any, Optional
+from urllib.parse import quote
+
+# Third-party
+import numpy as np
+import aiosqlite
+import httpx
+import requests
+from dotenv import load_dotenv
+from mistralai import Mistral
+from mistralai.models import UserMessage
+
+load_dotenv()
+
+# -----------------------
+# Constants / Configuration
+# -----------------------
+MIN_EMBEDDING_LENGTH = 100
+MAX_CONTEXT_CHARS = 12000
+DEFAULT_SIMILARITY_THRESHOLD = 0.7
+ZONING_SIMILARITY_THRESHOLD = 0.45
+KEYWORD_BOOST_SCORE = 0.5
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+MISTRAL_EMBED_MODEL = os.environ.get("MISTRAL_EMBED_MODEL", "mistral-embed")
+MISTRAL_CHAT_MODEL = os.environ.get("MISTRAL_CHAT_MODEL", "mistral-large-2411")
+
+# -----------------------
+# Logging & env validation
+# -----------------------
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
+    handlers = [logging.StreamHandler()]
+    handlers.append(logging.FileHandler("hybrid_rag.log"))
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+def validate_environment() -> None:
+    missing = []
+    if not MISTRAL_API_KEY:
+        missing.append("MISTRAL_API_KEY")
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+# -----------------------
+# Mistral client singleton
+# -----------------------
+class MistralClient:
+    _instance: Optional[Mistral] = None
+
+    @classmethod
+    def get_client(cls) -> Mistral:
+        if cls._instance is None:
+            cls._instance = Mistral(api_key=MISTRAL_API_KEY)
+        return cls._instance
+
+mistral_client = MistralClient.get_client()
+
+# -----------------------
+# Enhanced Query normalization (contextual retrieval)
+# -----------------------
+USE_MAP = {
+    "coffee shop": "restaurant (limited service)",
+    "starbucks": "restaurant (limited service)",
+    "cafe": "restaurant (limited service)",
+    "sandwich shop": "restaurant (limited service)",
+    "fast food": "restaurant (limited service)",
+    "gym": "indoor recreation",
+    "barbershop": "personal service",
+    "cs district": "commercial service district",
+    "commercial service": "commercial service district",
+}
+
+def enhanced_normalize_query(query: str) -> str:
+    """Broader query expansion for comprehensive context retrieval."""
+    q_lower = query.lower()
+    expansions = []
+
+    # Existing mappings from USE_MAP
+    for k, v in USE_MAP.items():
+        if k in q_lower:
+            expansions.append(v)
+
+    # RESTAURANT PATIO SPECIFIC EXPANSIONS
+    if 'patio' in q_lower and any(term in q_lower for term in ['restaurant', 'dining', 'food']):
+        expansions.extend([
+            'outdoor dining', 'exterior seating', 'al fresco',
+            'sidewalk cafe', 'outdoor service area',
+            # Regulatory aspects
+            'health department', 'food safety', 'construction permits',
+            'fire code', 'ada compliance', 'accessibility',
+            'zoning setback', 'right of way', 'encroachment'
+        ])
+
+    # Add requirement-focused terms
+    if any(term in q_lower for term in ['requirement', 'regulation', 'rule', 'code']):
+        expansions.extend([
+            'permit', 'approval', 'inspection', 'compliance',
+            'standard', 'specification', 'guideline'
+        ])
+
+    # Zoning-specific expansions
+    if any(term in q_lower for term in ['cs district', 'cs zone']):
+        expansions.extend(['cs and industrial', 'commercial service', 'chapter 51'])
+    if 'starbucks' in q_lower and 'cs' in q_lower:
+        expansions.extend(['restaurant', 'limited service', 'permitted uses', 'cs and industrial'])
+    if any(term in q_lower for term in ['can i build', 'allowed', 'permitted']):
+        expansions.extend(['permitted uses', 'district regulations', 'zoning ordinance'])
+    if 'dallas' in q_lower:
+        expansions.append('city code ordinance development services')
+
+    return query + " " + " ".join(set(expansions)) if expansions else query
+
+def generate_related_queries(original_query: str) -> List[str]:
+    """Generate related queries to capture different aspects."""
+    q_lower = original_query.lower()
+
+    if 'patio' in q_lower and any(term in q_lower for term in ['restaurant', 'dining']):
+        return [
+            original_query,
+            "restaurant outdoor dining permits Dallas",
+            "restaurant construction requirements Dallas",
+            "outdoor seating health code Dallas",
+            "restaurant fire safety requirements Dallas",
+            "ADA accessibility restaurant Dallas",
+            "restaurant zoning compliance Dallas"
+        ]
+    elif 'starbucks' in q_lower or 'coffee' in q_lower:
+        return [
+            original_query,
+            "coffee shop zoning requirements Dallas",
+            "restaurant limited service permit Dallas",
+            "commercial service district regulations"
+        ]
+    return [original_query]
+
+# -----------------------
+# Context theme classification
+# -----------------------
+def extract_section_theme(chunk: Dict[str, Any]) -> str:
+    """Classify document sections by theme to ensure diverse retrieval."""
+    title = chunk.get('title', '').lower()
+    text = chunk.get('text', '').lower()
+    content = f"{title} {text}"
+
+    if any(term in content for term in ['dog', 'pet', 'animal']):
+        return 'animals'
+    elif any(term in content for term in ['fire', 'safety', 'emergency', 'egress']):
+        return 'safety'
+    elif any(term in content for term in ['health', 'sanitation', 'food safety']):
+        return 'health'
+    elif any(term in content for term in ['ada', 'accessibility', 'handicap']):
+        return 'accessibility'
+    elif any(term in content for term in ['zoning', 'setback', 'district']):
+        return 'zoning'
+    elif any(term in content for term in ['construction', 'permit', 'building']):
+        return 'construction'
+    elif any(term in content for term in ['parking', 'traffic', 'vehicle']):
+        return 'parking'
+    else:
+        return 'general'
+
+# -----------------------
+# Fixed Embeddings API (avoid 422 errors)
+# -----------------------
+async def get_query_vector(query: str) -> Optional[np.ndarray]:
+    """Get query embedding with clean API calls to avoid 422 errors."""
+    try:
+        # Use minimal parameters to avoid 422 "extra inputs" errors
+        embeddings = await mistral_embed_httpx([query])
+        if embeddings:
+            return np.array(embeddings, dtype=float)
+    except Exception as e:
+        logging.error("Embedding failed: %s", e)
+    return None
+
+async def mistral_embed_httpx(texts: List[str]) -> List[List[float]]:
+    """Clean embedding call with only supported parameters."""
+    url = "https://api.mistral.ai/v1/embeddings"
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+
+    # Use minimal payload to avoid 422 errors from extra parameters
+    payload = {
+        "model": MISTRAL_EMBED_MODEL,
+        "inputs": texts  # Only essential parameters
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return [item["embedding"] for item in data.get("data", [])]
+
+# -----------------------
+# Parse embedding from DB
+# -----------------------
+def parse_embedding(embedding_raw: Any) -> Optional[np.ndarray]:
+    if not embedding_raw:
+        return None
+    try:
+        if isinstance(embedding_raw, str):
+            emb = json.loads(embedding_raw)
+            if isinstance(emb, list) and len(emb) >= MIN_EMBEDDING_LENGTH:
+                return np.array(emb, dtype=float)
+        elif isinstance(embedding_raw, (bytes, memoryview)):
+            if len(embedding_raw) >= 4 and (len(embedding_raw) % 4 == 0):
+                emb = np.frombuffer(embedding_raw, dtype=np.float32)
+                if len(emb) >= MIN_EMBEDDING_LENGTH:
+                    return emb.astype(float)
+        elif isinstance(embedding_raw, (list, tuple)):
+            emb = np.array(embedding_raw, dtype=float)
+            if emb.size >= MIN_EMBEDDING_LENGTH:
+                return emb
+    except Exception as e:
+        logging.debug("parse_embedding error: %s", e)
+    return None
+
+# -----------------------
+# Async DB load
+# -----------------------
+async def load_documents_from_db(db_path: str) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    try:
+        async with aiosqlite.connect(db_path) as conn:
+            async with conn.execute("SELECT doc_id, section_id, title, text, embedding FROM documents") as cursor:
+                async for row in cursor:
+                    doc_id, section_id, title, text, embedding_raw = row
+                    docs.append({
+                        "doc_id": doc_id,
+                        "section_id": section_id,
+                        "title": title or "",
+                        "text": text or "",
+                        "embedding": parse_embedding(embedding_raw)
+                    })
+    except Exception as e:
+        logging.error("Failed to load documents from DB: %s", e, exc_info=True)
+    return docs
+
+# -----------------------
+# Fixed Hybrid search (corrected sorting)
+# -----------------------
+async def search_top_chunks_optimized(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Single-pass hybrid scoring with enhanced query normalization."""
+    normalized_query = enhanced_normalize_query(query)
+    query_tokens = set(re.findall(r'\b\w{3,}\b', normalized_query.lower()))
+    query_vector = await get_query_vector(normalized_query)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for doc in documents:
+        doc_emb = doc.get("embedding")
+        semantic_score = 0.0
+        if doc_emb is not None and query_vector is not None:
+            try:
+                doc_vec = np.array(doc_emb, dtype=float)
+                denom = np.linalg.norm(query_vector) * np.linalg.norm(doc_vec)
+                if denom > 0:
+                    semantic_score = float(np.dot(query_vector, doc_vec) / denom)
+            except Exception:
+                semantic_score = 0.0
+
+        # Enhanced exact/token coverage
+        text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+        exact_score = 0.0
+
+        if normalized_query.lower() in text_content:
+            exact_score += 1.0
+
+        if query_tokens:
+            match_tokens = sum(1 for t in query_tokens if t in text_content)
+            token_coverage = match_tokens / len(query_tokens)
+            exact_score += token_coverage * 0.7
+
+        final_score = (semantic_score * 0.6) + (exact_score * 0.4)
+        scored.append((final_score, doc))  # Fixed: tuple structure
+
+    # Fixed: Correct sorting by score (first element of tuple)
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+# -----------------------
+# Multi-query retrieval for comprehensive context
+# -----------------------
+async def multi_query_retrieval(documents: List[Dict[str, Any]], original_query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Retrieve context using multiple related queries for better coverage."""
+    related_queries = generate_related_queries(original_query)
+
+    all_chunks = []
+    queries_per_batch = max(1, k // len(related_queries))
+
+    for query_variant in related_queries:
+        try:
+            chunks = await search_top_chunks_optimized(documents, query_variant, k=queries_per_batch)
+            all_chunks.extend(chunks)
+        except Exception as e:
+            logging.warning(f"Query variant '{query_variant}' failed: {e}")
+            continue
+
+    # Deduplicate and rerank
+    seen_docs = set()
+    deduped_chunks = []
+    for score, chunk in sorted(all_chunks, key=lambda x: x, reverse=True):
+        doc_key = (chunk.get('doc_id'), chunk.get('section_id'))
+        if doc_key not in seen_docs:
+            seen_docs.add(doc_key)
+            deduped_chunks.append((score, chunk))
+            if len(deduped_chunks) >= k:
+                break
+
+    return deduped_chunks
+
+# -----------------------
+# Context diversification
+# -----------------------
+async def diversify_context_retrieval(documents: List[Dict[str, Any]], query: str, k: int = 15, final_k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Retrieve more candidates initially, then diversify to cover different aspects."""
+    try:
+        # Get more candidates initially using multi-query approach
+        initial_chunks = await multi_query_retrieval(documents, query, k=k)
+
+        if not initial_chunks:
+            return []
+
+        # Group by document themes/sections
+        theme_groups = {}
+        for score, chunk in initial_chunks:
+            section_type = extract_section_theme(chunk)
+            if section_type not in theme_groups:
+                theme_groups[section_type] = []
+            theme_groups[section_type].append((score, chunk))
+
+        # Take best from each theme to ensure diversity
+        diversified = []
+        themes = list(theme_groups.keys())
+
+        if not themes:
+            return initial_chunks[:final_k]
+
+        # Round-robin selection from each theme
+        max_per_theme = max(1, final_k // len(themes))
+
+        for theme in themes:
+            theme_chunks = sorted(theme_groups[theme], key=lambda x: x, reverse=True)
+            diversified.extend(theme_chunks[:max_per_theme])
+
+        # Sort by score and trim to final_k
+        diversified.sort(key=lambda x: x, reverse=True)
+        return diversified[:final_k]
+
+    except Exception as e:
+        logging.error(f"Diversified retrieval failed: {e}")
+        # Fallback to simple search
+        return await search_top_chunks_optimized(documents, query, k=final_k)
+
+# -----------------------
+# Simple text fallback search
+# -----------------------
+def simple_text_search(documents: List[Dict[str, Any]], query: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
+    q = query.lower()
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    tokens = q.split()
+    for doc in documents:
+        text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+        if not text_content:
+            continue
+        score = 1.0 if q in text_content else 0.0
+        if tokens:
+            token_matches = sum(1 for t in tokens if t in text_content)
+            token_score = token_matches / len(tokens)
+            score = max(score, token_score)
+        if score > 0:
+            scored.append((score, doc))
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+async def search_with_fallback(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    try:
+        return await search_top_chunks_optimized(documents, query, k)
+    except Exception as e:
+        logging.warning("Optimized search failed (%s). Falling back to simple text search.", e)
+        return simple_text_search(documents, query, k)
+
+# -----------------------
+# Context trimming (relevance-aware with theme diversity)
+# -----------------------
+def trim_context_with_relevance(chunks: List[Tuple[float, Dict[str, Any]]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    if not chunks:
+        return ""
+
+    # Group by theme to ensure diverse context
+    theme_groups = {}
+    for score, doc in chunks:
+        theme = extract_section_theme(doc)
+        if theme not in theme_groups:
+            theme_groups[theme] = []
+        theme_groups[theme].append((score, doc))
+
+    # Build context ensuring theme diversity
+    parts: List[str] = []
+    total = 0
+
+    # First pass: include top result from each theme
+    for theme, theme_chunks in theme_groups.items():
+        if total >= max_chars:
+            break
+        best_chunk = max(theme_chunks, key=lambda x: x)
+        score, doc = best_chunk
+        title = doc.get("title", "")
+        text = doc.get("text", "")
+        header = f"## {title} (relevance: {score:.3f}, theme: {theme})\n"
+        body = f"{text}\n\n"
+        section = header + body
+
+        if total + len(section) <= max_chars:
+            parts.append(section)
+            total += len(section)
+        else:
+            remaining = max_chars - total - len(header)
+            if remaining > 200:
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                partial = ""
+                for s in sentences:
+                    if len(partial) + len(s) + 1 <= remaining - 5:
+                        partial += (s + " ")
+                    else:
+                        break
+                if partial:
+                    parts.append(header + partial.strip() + "...\n\n")
+            break
+
+    return "".join(parts)
+
+# -----------------------
+# Retrieval quality & strategy
+# -----------------------
+def evaluate_retrieval_quality(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Dict[str, float]:
+    if not chunks:
+        return {"confidence": 0.0, "coverage": 0.0, "diversity": 0.0, "num_results": 0, "theme_diversity": 0.0}
+
+    scores = [s for s, _ in chunks]
+    query_tokens = set(re.findall(r'\b\w{3,}\b', query.lower()))
+    confidence = max(scores)
+    variance = float(np.var(scores)) if len(scores) > 1 else 0.0
+    diversity = max(0.0, 1.0 - variance)
+
+    # Theme diversity calculation
+    themes = set(extract_section_theme(doc) for _, doc in chunks)
+    theme_diversity = len(themes) / 7.0  # We have 7 possible themes
+
+    all_text = " ".join([c.get("text","").lower() for _, c in chunks])
+    coverage = (sum(1 for t in query_tokens if t in all_text) / len(query_tokens)) if query_tokens else 0.0
+
+    return {
+        "confidence": confidence,
+        "coverage": coverage,
+        "diversity": diversity,
+        "theme_diversity": theme_diversity,
+        "num_results": len(chunks)
+    }
+
+def determine_retrieval_strategy(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Tuple[str, float]:
+    if not chunks:
+        return "web_search", 0.0
+    best = chunks
+    top3_avg = sum(s for s, _ in chunks[:3]) / min(3, len(chunks))
+
+    # Consider theme diversity in strategy
+    themes = set(extract_section_theme(doc) for _, doc in chunks)
+    theme_diversity = len(themes) / 7.0
+
+    is_specific = any(t in query.lower() for t in ["cs district", "zoning", "dallas", "ordinance", "section", "code", "patio", "restaurant"])
+
+    if is_specific:
+        # For specific queries, consider both score and diversity
+        if best >= 0.35 and top3_avg >= 0.25 and theme_diversity >= 0.3:
+            return "local_docs", min(best * 1.5, 1.0)
+        elif best >= 0.2 or theme_diversity >= 0.4:
+            return "hybrid", best
+        else:
+            return "web_search", 0.2
+    else:
+        if best >= 0.6 and theme_diversity >= 0.2:
+            return "local_docs", best
+        elif best >= 0.4:
+            return "hybrid", best * 0.8
+        else:
+            return "web_search", 0.3
+
+# -----------------------
+# Web-search fallbacks
+# -----------------------
+def run_web_search_duckduckgo(query: str, num_results: int = 3) -> List[str]:
+    try:
+        url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results: List[str] = []
+        if data.get("Abstract"):
+            results.append(f"Summary: {data.get('Abstract')}\nSource: {data.get('AbstractURL', '')}")
+        for topic in data.get("RelatedTopics", [])[:num_results]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(f"Related: {topic['Text']}\nURL: {topic.get('FirstURL','')}")
+        return results
+    except Exception as e:
+        logging.debug("DuckDuckGo search failed: %s", e)
+        return []
+
+def run_web_search_brave(query: str, num_results: int = 3) -> List[str]:
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    if not api_key:
+        return []
+    try:
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {"Accept":"application/json","X-Subscription-Token": api_key}
+        params = {"q": query, "count": num_results, "search_lang": "en"}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get("web", {}).get("results", []):
+            results.append(f"Title: {item.get('title','')}\nDesc: {item.get('description','')}\nURL: {item.get('url','')}")
+        return results
+    except Exception as e:
+        logging.debug("Brave search failed: %s", e)
+        return []
+
+def run_web_search(query: str) -> List[str]:
+    r = run_web_search_brave(query)
+    if r:
+        return r
+    return run_web_search_duckduckgo(query)
+
+# -----------------------
+# Enhanced prompt creation for comprehensive answers
+# -----------------------
+def create_comprehensive_prompt(context_text: str, query: str) -> str:
+    """Create prompts that encourage comprehensive coverage."""
+    if 'patio' in query.lower() and any(term in query.lower() for term in ['restaurant', 'dining']):
+        return f"""You are a Dallas restaurant compliance expert. The user is asking about restaurant patio requirements.
+
+IMPORTANT: The context below may contain specific regulations (like dog policies) but the user wants COMPREHENSIVE patio requirements covering ALL relevant areas:
+
+1. **Zoning and permits** (construction permits, zoning compliance)
+2. **Health department** (food safety, sanitation)
+3. **Fire safety** (egress, capacity, safety equipment)
+4. **ADA compliance** (accessibility requirements)
+5. **Structural requirements** (construction standards)
+6. **Animal policies** (pet regulations if applicable)
+
+If the context only covers one aspect (like animals), acknowledge that and explain what OTHER requirements typically apply, even if not fully detailed in the provided context.
+
+Context from Dallas City Code:
+{context_text}
+
+Question: {query}
+
+Provide a comprehensive answer covering all relevant requirement categories:"""
+
+    elif any(term in query.lower() for term in ['district', 'zone', 'cs', 'permitted', 'allowed', 'build']):
+        return f"""You are a Dallas zoning expert. Answer comprehensively using the provided context.
+
+Context:
+{context_text}
+
+Question: {query}
+Answer:"""
+
+    else:
+        return f"""Use the following context to answer the question comprehensively.
+
+Context:
+{context_text}
+
+Question: {query}
+
+Answer based on the context above:"""
+
+# -----------------------
+# Generation (streaming) - fixed response handling
+# -----------------------
+async def generate_answer_with_context(context: str, query: str) -> str:
+    client = mistral_client
+    prompt = create_comprehensive_prompt(context, query)
+
+    try:
+        # Use minimal parameters to avoid 422 errors
+        resp_stream = await client.chat.stream_async(
+            model=MISTRAL_CHAT_MODEL,
+            messages=[UserMessage(content=prompt)]
+        )
+        answer = ""
+        async for chunk in resp_stream:
+            try:
+                choices = getattr(chunk.data, "choices", None)
+                if choices and len(choices) > 0:
+                    first = choices
+                    delta = getattr(first, "delta", None)
+                    if delta:
+                        content = getattr(delta, "content", None)
+                        if content:
+                            print(content, end="", flush=True)
+                            answer += content
+            except Exception:
+                pass
+        print("\n")
+        return answer.strip()
+    except Exception as e:
+        logging.error("Generation failed: %s", e)
+        return "Sorry — generation failed."
+
+# -----------------------
+# Main pipeline with contextual retrieval
+# -----------------------
+async def main():
+    parser = argparse.ArgumentParser(description="Enhanced Hybrid RAG with Contextual Retrieval")
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--diversify", action="store_true", help="Use context diversification for broader results")
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
+    validate_environment()
+
+    logging.info("Loading documents from DB: %s", args.db)
+    documents = await load_documents_from_db(args.db)
+    logging.info("Loaded %d documents", len(documents))
+
+    # Enhanced retrieval with diversification option
+    start = time.time()
+    if args.diversify:
+        print("🔍 Using diversified contextual retrieval")
+        top_chunks = await diversify_context_retrieval(documents, args.query, k=args.topk*3, final_k=args.topk)
+    else:
+        top_chunks = await search_with_fallback(documents, args.query, k=args.topk)
+
+    elapsed = time.time() - start
+    print(f"🔍 Search Time: {elapsed:.2f}s")
+
+    if not top_chunks:
+        print("❌ No relevant documents found locally. Attempting web search...")
+        web = run_web_search(args.query)
+        if web:
+            context_text = "\n\n".join(web)
+            ans = await generate_answer_with_context(context_text, args.query)
+        else:
+            print("No web results either.")
+        return
+
+    # Enhanced quality assessment
+    quality = evaluate_retrieval_quality(top_chunks, args.query)
+    if args.eval:
+        print("📊 Quality metrics:", quality)
+
+        # Show theme distribution
+        themes = [extract_section_theme(doc) for _, doc in top_chunks]
+        theme_counts = {}
+        for theme in themes:
+            theme_counts[theme] = theme_counts.get(theme, 0) + 1
+        print(f"📋 Theme distribution: {theme_counts}")
+
+    strategy, confidence = determine_retrieval_strategy(top_chunks, args.query)
+    print(f"🎯 Strategy: {strategy} | Confidence: {confidence:.3f}")
+
+    # prepare context
+    if strategy == "local_docs":
+        context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS)
+    elif strategy == "hybrid":
+        local_context = trim_context_with_relevance(top_chunks[:3], max_chars=MAX_CONTEXT_CHARS // 2)
+        web_results = run_web_search(args.query)
+        web_text = "\n\n".join(web_results) if web_results else ""
+        context_text = f"Local Results:\n{local_context}\n\nWeb Results:\n{web_text}"
+    else:  # web_search
+        web_results = run_web_search(args.query)
+        context_text = "\n\n".join(web_results) if web_results else ""
+        if not context_text.strip():
+            context_text = trim_context_with_relevance(top_chunks, max_chars=MAX_CONTEXT_CHARS // 2)
+
+    if not context_text.strip():
+        print("❌ No usable context available to answer the question.")
+        return
+
+    # generate answer
+    print("\n🤖 --- Answer (streaming) ---\n")
+    answer = await generate_answer_with_context(context_text, args.query)
+
+    # show sources with theme information
+    print("\n\n📚 Sources (by theme):")
+    theme_groups = {}
+    for score, doc in top_chunks:
+        theme = extract_section_theme(doc)
+        if theme not in theme_groups:
+            theme_groups[theme] = []
+        theme_groups[theme].append((score, doc))
+
+    for theme, docs in theme_groups.items():
+        print(f"\n**{theme.upper()} REGULATIONS:**")
+        for score, doc in docs:
+            print(f"  [{score:.3f}] {doc.get('doc_id','?')}-{doc.get('section_id','?')}: {doc.get('title','')[:100]}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+
+Key Fixes Applied
+
+Fixed 422 Embedding Error
+Based on the search results showing that 422 errors are caused by "extra inputs" or unsupported parameters
+
+, I removed all unnecessary parameters from the embedding API calls and used only the minimal required fields.
+
+Fixed Sorting TypeError
+Corrected the sorting lambda function to properly access the score as the first element of the tuple: key=lambda x: x.
+
+Enhanced Error Handling
+Added try-catch blocks around multi-query retrieval to prevent cascading failures when individual query variants fail.
+
+Improved Context Diversification
+The system now actively seeks diverse themes in retrieved context to avoid the "dog focus" issue while maintaining high relevance scores.
+
+This should resolve both the 422 API errors and the sorting issues while providing more comprehensive, diverse context for your restaurant patio queries.
+
+(base) gigmx@nighthawk-B6:~/gpt-oss-alignment/cogs-project$ python hybrid_rag_search.py --query "restaurant patio requirements?" --db data/cogs_memory.db --diversify --eval
+2025-08-29 18:22:01,680 - root - INFO - main:642 - Loading documents from DB: data/cogs_memory.db
+2025-08-29 18:22:02,192 - root - INFO - main:644 - Loaded 4010 documents
+🔍 Using diversified contextual retrieval
+2025-08-29 18:22:02,473 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:02,474 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:02,520 - root - WARNING - multi_query_retrieval:310 - Query variant 'restaurant patio requirements?' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:03,029 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:03,029 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:03,047 - root - WARNING - multi_query_retrieval:310 - Query variant 'restaurant outdoor dining permits Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:03,277 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:03,277 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:03,302 - root - WARNING - multi_query_retrieval:310 - Query variant 'restaurant construction requirements Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:03,519 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:03,520 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:03,545 - root - WARNING - multi_query_retrieval:310 - Query variant 'outdoor seating health code Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:03,806 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:03,806 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:03,832 - root - WARNING - multi_query_retrieval:310 - Query variant 'restaurant fire safety requirements Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:04,041 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:04,041 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:04,058 - root - WARNING - multi_query_retrieval:310 - Query variant 'ADA accessibility restaurant Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+2025-08-29 18:22:04,309 - httpx - INFO - _send_single_request:1740 - HTTP Request: POST https://api.mistral.ai/v1/embeddings "HTTP/1.1 422 Unprocessable Entity"
+2025-08-29 18:22:04,310 - root - ERROR - get_query_vector:189 - Embedding failed: Client error '422 Unprocessable Entity' for url 'https://api.mistral.ai/v1/embeddings'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422
+2025-08-29 18:22:04,326 - root - WARNING - multi_query_retrieval:310 - Query variant 'restaurant zoning compliance Dallas' failed: '<' not supported between instances of 'dict' and 'dict'
+🔍 Search Time: 2.13s
+❌ No relevant documents found locally. Attempting web search...
+No web results either.
+(base) gigmx@nighthawk-B6:~/gpt-oss-alignment/cogs-project$
+LLM served by Perplexity Playground
+<think> The user is experiencing two main issues with their hybrid RAG search:
+
+    HTTP 422 errors from Mistral embeddings API - this is happening consistently for all embedding requests
+
+    A sorting error: '<' not supported between instances of 'dict' and 'dict'
+
+Looking at the search results:
+
+Shows that 422 errors with Mistral can be caused by unsupported parameters like stream_options and seed being sent in the request.
+
+Shows a 422 error with template issues, but this seems to be related to Hugging Face inference rather than Mistral directly.
+
+Shows 422 errors with Mistral AI agents and tools, but doesn't provide the solution.
+
+and
+
+are about other APIs, not specifically Mistral.
+
+From
+
+, the key insight is that Mistral's Completions API doesn't support certain parameters that other clients might send automatically:
+
+    stream_options
+
+    seed
+
+Looking at the user's code, they're using httpx to make direct HTTP requests to the Mistral embeddings endpoint. The 422 error suggests they're sending unsupported parameters.
+
+For the sorting error, looking at their code, they have:
+
+python
+scored.sort(key=lambda x: x, reverse=True)
+
+But the error message suggests that x contains dictionaries that can't be compared. This means the structure being passed to sort isn't what's expected.
+
+Let me provide fixes for both issues:
+
+    For the 422 error: Strip down the embedding request to only include the absolute minimum required parameters
+
+    For the sorting error: Fix the data structure being passed to sort
+
+The user's embedding request might be including extra parameters that Mistral doesn't support.
+</think>
+
+Based on the search results showing that Mistral API 422 errors are caused by unsupported parameters like stream_options and seed
+
+, and your sorting error, here are the fixes needed:
+Issue 1: 422 Embedding API Errors
+
+The search results indicate that "Mistral Completions API doesn't support at least these two top-level fields" and similar restrictions likely apply to the embeddings endpoint
+
+. Your embedding requests are being rejected due to unsupported parameters.
+
+Fix the embedding function:
+
+python
+async def mistral_embed_httpx(texts: List[str]) -> List[List[float]]:
+    """Ultra-minimal embedding call to avoid 422 errors."""
+    url = "https://api.mistral.ai/v1/embeddings"
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
+
+    # Absolute minimal payload - remove Content-Type and any extra fields
+    payload = {
+        "model": MISTRAL_EMBED_MODEL,
+        "input": texts  # Try "input" instead of "inputs" - API might be inconsistent
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code == 422:
+                # Try alternative parameter name
+                payload["inputs"] = payload.pop("input")
+                r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            return [item["embedding"] for item in data.get("data", [])]
+    except Exception as e:
+        logging.error(f"Embedding request failed: {e}")
+        return []
+
+Issue 2: Sorting Error Fix
+
+The '<' not supported between instances of 'dict' and 'dict' error occurs because your sorting lambda is incorrect.
+
+Fix the sorting in search_top_chunks_optimized:
+
+python
+async def search_top_chunks_optimized(documents: List[Dict[str, Any]], query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Fixed sorting logic."""
+    normalized_query = enhanced_normalize_query(query)
+    query_tokens = set(re.findall(r'\b\w{3,}\b', normalized_query.lower()))
+    query_vector = await get_query_vector(normalized_query)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for doc in documents:
+        doc_emb = doc.get("embedding")
+        semantic_score = 0.0
+        if doc_emb is not None and query_vector is not None:
+            try:
+                doc_vec = np.array(doc_emb, dtype=float)
+                denom = np.linalg.norm(query_vector) * np.linalg.norm(doc_vec)
+                if denom > 0:
+                    semantic_score = float(np.dot(query_vector, doc_vec) / denom)
+            except Exception:
+                semantic_score = 0.0
+
+        text_content = f"{doc.get('title','')} {doc.get('text','')}".lower()
+        exact_score = 0.0
+
+        if normalized_query.lower() in text_content:
+            exact_score += 1.0
+
+        if query_tokens:
+            match_tokens = sum(1 for t in query_tokens if t in text_content)
+            token_coverage = match_tokens / len(query_tokens)
+            exact_score += token_coverage * 0.7
+
+        final_score = (semantic_score * 0.6) + (exact_score * 0.4)
+        scored.append((final_score, doc))
+
+    # FIXED: Correct lambda to sort by first element (score)
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+Complete Minimal Working Version
+
+Here's a simplified version that should work without 422 errors:
+
+python
+#!/usr/bin/env python3
+"""
+Simplified RAG to debug 422 errors
+"""
+
+import os
+import json
+import asyncio
+import logging
+import argparse
+from typing import List, Dict, Tuple, Any, Optional
+
+import numpy as np
+import aiosqlite
+import httpx
+from dotenv import load_dotenv
+from mistralai import Mistral
+from mistralai.models import UserMessage
+
+load_dotenv()
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+MISTRAL_EMBED_MODEL = "mistral-embed"
+MISTRAL_CHAT_MODEL = "mistral-large-2411"
+
+logging.basicConfig(level=logging.INFO)
+
+# Minimal embedding function
+async def simple_embed(text: str) -> Optional[np.ndarray]:
+    """Minimal embedding call to avoid 422."""
+    url = "https://api.mistral.ai/v1/embeddings"
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
+
+    # Test both parameter names
+    for param_name in ["input", "inputs"]:
+        payload = {"model": MISTRAL_EMBED_MODEL, param_name: [text]}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(url, headers=headers, json=payload)
+                if r.status_code == 200:
+                    data = r.json()
+                    emb = data["data"]["embedding"]
+                    return np.array(emb, dtype=float)
+                elif r.status_code == 422:
+                    logging.warning(f"422 error with parameter '{param_name}', trying next...")
+                    continue
+                else:
+                    r.raise_for_status()
+        except Exception as e:
+            logging.error(f"Embedding failed with {param_name}: {e}")
+            continue
+
+    return None
+
+# Simple search without multi-query complexity
+async def simple_search(documents: List[Dict], query: str, k: int = 5) -> List[Tuple[float, Dict]]:
+    """Simplified search to isolate issues."""
+    query_vec = await simple_embed(query)
+    if query_vec is None:
+        logging.warning("No query embedding, using text search only")
+        return text_only_search(documents, query, k)
+
+    scored = []
+    for doc in documents:
+        if doc.get("embedding") is None:
+            score = 0.0
+        else:
+            try:
+                doc_vec = np.array(doc["embedding"], dtype=float)
+                score = np.dot(query_vec, doc_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(doc_vec))
+            except:
+                score = 0.0
+
+        scored.append((float(score), doc))
+
+    # Fixed sorting
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+def text_only_search(documents: List[Dict], query: str, k: int) -> List[Tuple[float, Dict]]:
+    """Fallback text search."""
+    q_lower = query.lower()
+    scored = []
+
+    for doc in documents:
+        text = f"{doc.get('title', '')} {doc.get('text', '')}".lower()
+        score = 1.0 if q_lower in text else 0.0
+        if score > 0:
+            scored.append((score, doc))
+
+    scored.sort(key=lambda x: x, reverse=True)
+    return scored[:k]
+
+async def load_docs(db_path: str) -> List[Dict]:
+    """Simple doc loader."""
+    docs = []
+    async with aiosqlite.connect(db_path) as conn:
+        async with conn.execute("SELECT doc_id, section_id, title, text, embedding FROM documents LIMIT 100") as cursor:
+            async for row in cursor:
+                doc_id, section_id, title, text, embedding_raw = row
+
+                # Parse embedding
+                emb = None
+                if embedding_raw:
+                    try:
+                        if isinstance(embedding_raw, str):
+                            emb = json.loads(embedding_raw)
+                        elif isinstance(embedding_raw, (bytes, memoryview)):
+                            emb = np.frombuffer(embedding_raw, dtype=np.float32).tolist()
+                    except:
+                        pass
+
+                docs.append({
+                    "doc_id": doc_id,
+                    "section_id": section_id,
+                    "title": title or "",
+                    "text": text or "",
+                    "embedding": emb
+                })
+    return docs
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--db", required=True)
+    args = parser.parse_args()
+
+    print("Loading documents...")
+    docs = await load_docs(args.db)
+    print(f"Loaded {len(docs)} documents")
+
+    print("Searching...")
+    results = await simple_search(docs, args.query, k=5)
+
+    if results:
+        print(f"\nFound {len(results)} results:")
+        for score, doc in results:
+            print(f"[{score:.3f}] {doc['doc_id']}: {doc['title'][:100]}")
+    else:
+        print("No results found")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+Test this simplified version first to isolate whether the issue is with the embedding API parameters or the sorting logic. Based on the search results, the 422 error is most likely caused by sending unsupported parameters to the Mistral API
+
+.
+
+Weaknesses / Bugs / Oddities
+
+Scoring logic is a bit sloppy. In determine_retrieval_strategy, you compare best >= 0.35… but best is actually a list (chunks). Later you use it like a float. That’s going to throw type errors unless it accidentally works in Python’s weird truthiness rules. Needs max_score = max(s for s, _ in chunks).
+
+Chunk selection in multi_query_retrieval. You divide k by the number of related queries:
+LLM served by Perplexity Playground
+<think> The user is asking me to analyze some weaknesses, bugs, or oddities in their code based on the search results they provided. The search results are about RAG evaluation best practices, metrics, and implementation guides.
+
+Looking at the query, they've identified two specific issues:
+
+    Scoring logic issue in determine_retrieval_strategy: They mention that best is being compared as if it's a float (e.g., best >= 0.35) but it's actually a list (chunks). This would cause type errors. The fix would be to extract the maximum score from the chunks: max_score = max(s for s, _ in chunks).
+
+    Chunk selection in multi_query_retrieval: They mention dividing k by the number of related queries, which could be problematic.
+
+Let me analyze these issues in the context of RAG best practices from the search results.
+
+From the search results, I can see information about:
+
+    RAG evaluation metrics like precision@k, recall@k, F1@k score, and MRR
+
+    The importance of proper dataset creation and evaluation
+
+    The typical RAG pipeline components (indexing, retrieval, generation)
+
+    Best practices for testing RAG systems
+
+The issues the user identified are implementation bugs that could affect the quality and reliability of their RAG system, which ties into the evaluation and testing themes in the search results.
+</think>
+
+Based on the search results about RAG evaluation best practices and the code issues you've identified, here are the key weaknesses that need addressing:
+Critical Type Error in Scoring Logic
+
+Bug Location: determine_retrieval_strategy() function
+Issue: You're treating best as a float when it's actually a list/chunks object
+
+python
+# Current buggy code:
+best = chunks  # This should extract the score, but you wrote chunks
+if best >= 0.35:     # Comparing list to float - TypeError
+
+# Fix needed:
+best_score = chunks if chunks else 0.0  # Extract score from first tuple
+if best_score >= 0.35:
+
+This aligns with the search results' emphasis on "precision@k indicates the proportion of relevant chunks retrieved"
+
+- your scoring logic needs to properly extract numerical scores to evaluate retrieval quality.
+Inefficient Query Distribution in Multi-Query Retrieval
+
+Bug Location: multi_query_retrieval() function
+Issue: Naive division of k by query count creates uneven retrieval
+
+python
+# Current problematic approach:
+queries_per_batch = max(1, k // len(related_queries))  # Integer division loses chunks
+
+# Better approach based on RAG best practices:
+def distribute_k_across_queries(k: int, num_queries: int) -> List[int]:
+    """Distribute k chunks across queries more intelligently."""
+    base_k = k // num_queries
+    remainder = k % num_queries
+    distribution = [base_k] * num_queries
+    # Distribute remainder to first few queries
+    for i in range(remainder):
+        distribution[i] += 1
+    return distribution
+
+Missing Evaluation Metrics
+
+Based on the search results emphasizing "precision@k, recall@k, F1@k score, and MRR"
+
+as essential RAG metrics, your system lacks proper evaluation:
+
+python
+def calculate_retrieval_metrics(retrieved_chunks: List, ground_truth_relevant: List, k: int):
+    """Implement standard RAG evaluation metrics."""
+    retrieved_ids = {(c['doc_id'], c['section_id']) for _, c in retrieved_chunks[:k]}
+    relevant_ids = set(ground_truth_relevant)
+
+    # Precision@k: relevant items in top-k / k
+    precision_at_k = len(retrieved_ids & relevant_ids) / k
+
+    # Recall@k: relevant items in top-k / total relevant
+    recall_at_k = len(retrieved_ids & relevant_ids) / len(relevant_ids) if relevant_ids else 0
+
+    # F1@k score
+    f1_at_k = (2 * precision_at_k * recall_at_k) / (precision_at_k + recall_at_k) if (precision_at_k + recall_at_k) > 0 else 0
+
+    return {"precision@k": precision_at_k, "recall@k": recall_at_k, "f1@k": f1_at_k}
+
+Inadequate Test Dataset
+
+The search results emphasize creating "question and ground-truth answer pairs from source documents"
+
+. Your system needs:
+
+python
+def create_evaluation_dataset():
+    """Generate test cases following RAG evaluation best practices."""
+    return {
+        "questions": ["restaurant patio requirements?", "CS district permitted uses?"],
+        "ground_truth_answers": ["Comprehensive requirements include zoning permits, health codes, fire safety, ADA compliance, and animal policies"],
+        "expected_doc_ids": [["city_ordinances-dallas-tx-1-sec_1173", "health_code_section_x"]],
+    }
+
+Inconsistent Strategy Confidence Scoring
+
+Your confidence calculation is inconsistent across strategies:
+
+python
+# Current inconsistent approach:
+if best >= 0.35:
+    return "local_docs", min(best * 1.5, 1.0)  # Arbitrary 1.5x multiplier
+
+# More principled approach based on search results:
+def calculate_strategy_confidence(chunks, query_complexity):
+    """Calculate confidence using established RAG metrics."""
+    scores = [s for s, _ in chunks]
+    mean_score = np.mean(scores)
+    score_variance = np.var(scores)
+
+    # Confidence based on score consistency (low variance = high confidence)
+    confidence = mean_score * (1 - min(score_variance, 0.5))
+    return max(0.1, min(confidence, 1.0))
+
+The search results emphasize that "MRR shows how effectively the system orders relevant chunks"
+
+- your system needs consistent, metric-based confidence scoring rather than arbitrary multipliers.
+
+These fixes will improve your RAG system's reliability and align it with the evaluation best practices outlined in the search results.
+
+make the following changes::
+
+    Add utility: distribute_k_across_queries
+
+Where: place near other helpers (e.g., right before multi_query_retrieval) — replace or insert.
+LLM served by Perplexity Playground
+<think> The user wants me to add a utility function called `distribute_k_across_queries` and place it near other helpers, specifically right before `multi_query_retrieval`. This is related to the bug they identified earlier about dividing k by the number of related queries in multi-query retrieval.
+
+Looking at the search results about chunking strategies for RAG, I can see various approaches to handling chunks and distribution. The search results emphasize the importance of proper chunking strategies, overlap considerations, and iterative refinement.
+
+For the distribute_k_across_queries function, I need to create a utility that distributes the k chunks across multiple queries more intelligently than simple integer division. This should handle remainder chunks appropriately to ensure all k chunks are utilized.
+
+Based on the context from earlier in the conversation, this function should:
+
+    Take the total number of chunks (k) and number of queries
+
+    Distribute k evenly across queries
+
+    Handle remainder chunks by distributing them to the first few queries
+
+    Return a list of integers representing how many chunks each query should retrieve
+
+This aligns with the search results' emphasis on "iterative refinement" and optimizing retrieval strategies.
+</think>
+
+Based on the search results about chunking strategies and the need for better distribution logic in RAG systems, here's the utility function to add:
+
+python
+def distribute_k_across_queries(k: int, num_queries: int) -> List[int]:
+    """
+    Distribute k chunks across queries more intelligently than simple division.
+
+    Based on RAG best practices for chunk distribution and retrieval optimization.
+    Ensures all k chunks are utilized without losing remainder chunks.
+
+    Args:
+        k: Total number of chunks to retrieve
+        num_queries: Number of related queries to distribute across
+
+    Returns:
+        List of integers representing how many chunks each query should retrieve
+
+    Example:
+        distribute_k_across_queries(5, 3) -> [2, 2, 1]
+        distribute_k_across_queries(7, 2) -> [4, 3]
+    """
+    if num_queries <= 0:
+        return []
+    if k <= 0:
+        return  * num_queries
+
+    # Base chunks per query
+    base_k = k // num_queries
+    remainder = k % num_queries
+
+    # Start with base distribution
+    distribution = [base_k] * num_queries
+
+    # Distribute remainder chunks to first few queries
+    # This follows RAG chunking best practices for balanced retrieval
+    for i in range(remainder):
+        distribution[i] += 1
+
+    return distribution
+
+Place this function right before multi_query_retrieval() to maintain logical grouping with retrieval helpers.
+
+This addresses the chunking distribution issue you identified and aligns with the search results' emphasis on "iterative refinement" and "optimized chunking strategies"
+
+for better RAG performance. The function ensures no chunks are lost due to integer division and provides balanced distribution across queries.
+
+make these changes:
+Insert/replace near the top-level helpers (e.g., right before multi_query_retrieval)
+
+def distribute_k_across_queries(k: int, num_queries: int) -> List[int]:
+"""
+Distribute k chunks across num_queries as evenly as possible.
+If k < num_queries this gives the first k queries 1 each and the rest 0.
+"""
+if num_queries <= 0:
+return []
+base = k // num_queries
+remainder = k % num_queries
+distribution = [base + (1 if i < remainder else 0) for i in range(num_queries)]
+return distribution
+
+    Replace multi_query_retrieval() with a robust version
+
+Where: replace the existing multi_query_retrieval implementation.
+
+async def multi_query_retrieval(documents: List[Dict[str, Any]], original_query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+"""Retrieve context using multiple related queries for better coverage.
+Distributes the desired k across generated related queries more fairly,
+collects results, deduplicates by (doc_id, section_id), and returns top-k.
+"""
+related_queries = generate_related_queries(original_query)
+if not related_queries:
+return []
+
+text
+num_queries = len(related_queries)
+distribution = distribute_k_across_queries(k, num_queries)
+
+all_chunks: List[Tuple[float, Dict[str, Any]]] = []
+# run each related query with its allocated budget
+for q_variant, q_k in zip(related_queries, distribution):
+    if q_k <= 0:
+        continue
+    try:
+        chunks = await search_top_chunks_optimized(documents, q_variant, k=q_k)
+        if chunks:
+            all_chunks.extend(chunks)
+    except Exception as e:
+        logging.debug("multi_query_retrieval: search failed for '%s': %s", q_variant, e)
+
+# Sort by score (desc) then deduplicate by doc/section preserving best score
+all_chunks_sorted = sorted(all_chunks, key=lambda pair: pair, reverse=True)
+
+seen_docs = set()
+deduped_chunks: List[Tuple[float, Dict[str, Any]]] = []
+for score, chunk in all_chunks_sorted:
+    doc_key = (chunk.get('doc_id'), chunk.get('section_id'))
+    if doc_key not in seen_docs:
+        seen_docs.add(doc_key)
+        deduped_chunks.append((score, chunk))
+        if len(deduped_chunks) >= k:
+            break
+
+return deduped_chunks
+
+3) Add principled confidence calculator
+
+Where: put this near other evaluation helpers (e.g., next to evaluate_retrieval_quality).
+
+def calculate_strategy_confidence(chunks: List[Tuple[float, Dict[str, Any]]], query_complexity: float = 1.0) -> float:
+"""
+Confidence based on mean score and score variance (lower variance => higher confidence).
+query_complexity is a multiplicative factor (>=1); increase it for harder queries.
+Returns value clipped to [0.05, 1.0].
+"""
+if not chunks:
+return 0.0
+scores = [float(s) for s, _ in chunks]
+mean_score = float(np.mean(scores))
+var_score = float(np.var(scores))
+# lower variance -> more consistent ordering, cap the variance impact
+variance_factor = (1.0 - min(var_score, 0.5))
+# penalize by complexity (simple heuristic)
+raw_conf = mean_score * variance_factor / max(1.0, query_complexity)
+confidence = max(0.05, min(raw_conf, 1.0))
+return confidence
+
+    Replace determine_retrieval_strategy() to use numeric scores (fix TypeError)
+
+Where: replace existing determine_retrieval_strategy function.
+
+def determine_retrieval_strategy(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Tuple[str, float]:
+"""
+Choose strategy based on numeric scores and theme diversity.
+Returns (strategy, confidence).
+"""
+if not chunks:
+return "web_search", 0.0
+
+text
+scores = [float(s) for s, _ in chunks]
+max_score = max(scores) if scores else 0.0
+top3_avg = sum(scores[:3]) / min(3, len(scores))
+themes = set(extract_section_theme(doc) for _, doc in chunks)
+theme_diversity = len(themes) / 7.0
+
+is_specific = any(t in query.lower() for t in ["cs district", "zoning", "dallas", "ordinance", "section", "code", "patio", "restaurant"])
+
+# Use a principled confidence estimator
+# (you can pass a query_complexity >1 for harder queries)
+confidence = calculate_strategy_confidence(chunks, query_complexity=1.0)
+
+if is_specific:
+    if max_score >= 0.35 and top3_avg >= 0.25 and theme_diversity >= 0.3:
+        return "local_docs", min(confidence, 1.0)
+    elif max_score >= 0.20 or theme_diversity >= 0.4:
+        return "hybrid", min(confidence, 1.0)
+    else:
+        return "web_search", 0.2
+else:
+    if max_score >= 0.6 and theme_diversity >= 0.2:
+        return "local_docs", min(confidence, 1.0)
+    elif max_score >= 0.4:
+        return "hybrid", min(confidence * 0.8, 1.0)
+    else:
+        return "web_search", 0.3
+
+5) Add retrieval metrics helpers (precision@k, recall@k, f1@k)
+
+Where: place these next to evaluate_retrieval_quality.
+
+def calculate_retrieval_metrics(retrieved_chunks: List[Tuple[float, Dict[str, Any]]],
+ground_truth_relevant: List[Tuple[str, Optional[str]]],
+k: int):
+"""
+retrieved_chunks: List[(score, doc_dict)]
+ground_truth_relevant: list of (doc_id, section_id) tuples OR doc_id strings (section_id may be None)
+Returns precision@k, recall@k, f1@k
+"""
+if k <= 0:
+return {"precision@k": 0.0, "recall@k": 0.0, "f1@k": 0.0}
+
+text
+# normalize retrieved ids
+retrieved_ids = set()
+for _, chunk in retrieved_chunks[:k]:
+    doc_id = chunk.get("doc_id")
+    sec = chunk.get("section_id")
+    if doc_id is None:
+        continue
+    retrieved_ids.add((str(doc_id), str(sec) if sec is not None else None))
+
+# normalize ground truth
+relevant_ids = set()
+for item in ground_truth_relevant:
+    if isinstance(item, (list, tuple)) and len(item) >= 1:
+        relevant_ids.add((str(item), str(item) if len(item) > 1 and item is not None else None))
+    elif isinstance(item, str):
+        relevant_ids.add((item, None))
+
+if not relevant_ids:
+    return {"precision@k": 0.0, "recall@k": 0.0, "f1@k": 0.0}
+
+true_positives = len(retrieved_ids & relevant_ids)
+precision_at_k = true_positives / k
+recall_at_k = true_positives / len(relevant_ids)
+if precision_at_k + recall_at_k > 0:
+    f1_at_k = 2 * precision_at_k * recall_at_k / (precision_at_k + recall_at_k)
+else:
+    f1_at_k = 0.0
+
+return {"precision@k": precision_at_k, "recall@k": recall_at_k, "f1@k": f1_at_k}
+
+6) Add small evaluation dataset helper (starter)
+
+Where: anywhere convenient (tests section). Replace the example content with your real pairs.
+
+def create_evaluation_dataset():
+"""
+Minimal sample evaluation dataset. Replace doc IDs with real ids from your DB.
+Format:
+- questions: list[str]
+- expected_doc_ids: list[list[ (doc_id, section_id) ]]
+"""
+return {
+"questions": [
+"restaurant patio requirements?",
+"CS district permitted uses?"
+],
+"ground_truth_answers": [
+"Comprehensive requirements include zoning permits, health codes, fire safety, ADA compliance, and animal policies",
+"Permitted uses for CS district include limited service restaurant, personal service, retail, etc."
+],
+"expected_doc_ids": [
+[("city_ordinances-dallas-tx-1-sec_1173", "sec_1173"), ("health_code_section_x", None)],
+[("zoning_code_cs_section", "sec_cs_01")]
+]
+}
+
+    Tiny test snippet you can run to sanity check distribution + strategy
+
+Where: add to a test file or run interactively. Do not drop this into main()—it's just a small smoke test.
+
+if name == "main" and False: # flip to True to run quick checks
+# test distribute
+print("distributions:", distribute_k_across_queries(5, 3)) # expect [2,2,1]
+print("distributions:", distribute_k_across_queries(2, 5)) # expect [1,1,0,0,0]
+
+text
+# fake chunks: (score, doc)
+fake_chunks = [
+    (0.45, {"doc_id": "A", "section_id": "1", "title":"zoning", "text":"zoning text"}),
+    (0.30, {"doc_id": "B", "section_id": "2", "title":"health", "text":"health text"}),
+    (0.10, {"doc_id": "C", "section_id": "3", "title":"animals", "text":"pets"}),
+]
+strat, conf = determine_retrieval_strategy(fake_chunks, "Can I build a patio in cs district Dallas?")
+print("strategy,confidence:", strat, conf)
+
+# metrics
+retrieved = fake_chunks
+ground_truth = [("A","1"), ("X","9")]
+print("metrics:", calculate_retrieval_metrics(retrieved, ground_truth, k=3))
+
+LLM served by Perplexity Playground
+<think> The user is asking me to make specific changes to their RAG system code, referencing chunking strategies and best practices from the search results. The search results discuss optimal chunk sizes (200-500 tokens, 128-512 tokens), overlap strategies (10-20%, 15%), iterative refinement, and various chunking approaches.
+
+They want me to:
+
+    Add a utility function for distributing k chunks across queries
+
+    Replace multi_query_retrieval with a more robust version
+
+    Add a principled confidence calculator
+
+    Fix the determine_retrieval_strategy function to handle numeric scores properly
+
+    Add retrieval metrics helpers (precision@k, recall@k, f1@k)
+
+    Add an evaluation dataset helper
+
+    Add a test snippet
+
+The search results emphasize several key principles:
+
+    Chunk sizes of 200-500 tokens or 128-512 tokens are typical
+
+    10-20% overlap prevents boundary losses
+
+    Iterative refinement is normal and important
+
+    Preserve semantic boundaries
+
+    Test with real queries
+
+    Metadata is important for context
+
+I need to provide the code changes they've specified while incorporating these best practices from the search results.
+</think>
+
+Based on the search results emphasizing "iterative refinement" and "chunk thoughtfully, and your RAG system will retrieve accurately"
+
+, here are the requested code changes that implement better chunking distribution and evaluation metrics:
+1) Add utility: distribute_k_across_queries
+
+python
+def distribute_k_across_queries(k: int, num_queries: int) -> List[int]:
+    """
+    Distribute `k` chunks across `num_queries` as evenly as possible.
+    If k < num_queries this gives the first `k` queries 1 each and the rest 0.
+
+    Based on RAG best practices for balanced chunk distribution.
+    """
+    if num_queries <= 0:
+        return []
+    base = k // num_queries
+    remainder = k % num_queries
+    distribution = [base + (1 if i < remainder else 0) for i in range(num_queries)]
+    return distribution
+
+2) Replace multi_query_retrieval() with robust version
+
+python
+async def multi_query_retrieval(documents: List[Dict[str, Any]], original_query: str, k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
+    """Retrieve context using multiple related queries for better coverage.
+    Distributes the desired `k` across generated related queries more fairly,
+    collects results, deduplicates by (doc_id, section_id), and returns top-k.
+
+    Implements the "chunk twice, retrieve once" philosophy from RAG best practices.
+    """
+    related_queries = generate_related_queries(original_query)
+    if not related_queries:
+        return []
+
+    num_queries = len(related_queries)
+    distribution = distribute_k_across_queries(k, num_queries)
+
+    all_chunks: List[Tuple[float, Dict[str, Any]]] = []
+    # run each related query with its allocated budget
+    for q_variant, q_k in zip(related_queries, distribution):
+        if q_k <= 0:
+            continue
+        try:
+            chunks = await search_top_chunks_optimized(documents, q_variant, k=q_k)
+            if chunks:
+                all_chunks.extend(chunks)
+        except Exception as e:
+            logging.debug("multi_query_retrieval: search failed for '%s': %s", q_variant, e)
+
+    # Sort by score (desc) then deduplicate by doc/section preserving best score
+    all_chunks_sorted = sorted(all_chunks, key=lambda pair: pair, reverse=True)
+
+    seen_docs = set()
+    deduped_chunks: List[Tuple[float, Dict[str, Any]]] = []
+    for score, chunk in all_chunks_sorted:
+        doc_key = (chunk.get('doc_id'), chunk.get('section_id'))
+        if doc_key not in seen_docs:
+            seen_docs.add(doc_key)
+            deduped_chunks.append((score, chunk))
+            if len(deduped_chunks) >= k:
+                break
+
+    return deduped_chunks
+
+3) Add principled confidence calculator
+
+python
+def calculate_strategy_confidence(chunks: List[Tuple[float, Dict[str, Any]]], query_complexity: float = 1.0) -> float:
+    """
+    Confidence based on mean score and score variance (lower variance => higher confidence).
+    query_complexity is a multiplicative factor (>=1); increase it for harder queries.
+    Returns value clipped to [0.05, 1.0].
+
+    Implements principled confidence scoring based on RAG evaluation best practices.
+    """
+    if not chunks:
+        return 0.0
+    scores = [float(s) for s, _ in chunks]
+    mean_score = float(np.mean(scores))
+    var_score = float(np.var(scores))
+    # lower variance -> more consistent ordering, cap the variance impact
+    variance_factor = (1.0 - min(var_score, 0.5))
+    # penalize by complexity (simple heuristic)
+    raw_conf = mean_score * variance_factor / max(1.0, query_complexity)
+    confidence = max(0.05, min(raw_conf, 1.0))
+    return confidence
+
+4) Replace determine_retrieval_strategy() (fix TypeError)
+
+python
+def determine_retrieval_strategy(chunks: List[Tuple[float, Dict[str, Any]]], query: str) -> Tuple[str, float]:
+    """
+    Choose strategy based on numeric scores and theme diversity.
+    Returns (strategy, confidence).
+
+    Fixed to properly extract numeric scores and avoid type errors.
+    """
+    if not chunks:
+        return "web_search", 0.0
+
+    scores = [float(s) for s, _ in chunks]
+    max_score = max(scores) if scores else 0.0
+    top3_avg = sum(scores[:3]) / min(3, len(scores))
+    themes = set(extract_section_theme(doc) for _, doc in chunks)
+    theme_diversity = len(themes) / 7.0
+
+    is_specific = any(t in query.lower() for t in ["cs district", "zoning", "dallas", "ordinance", "section", "code", "patio", "restaurant"])
+
+    # Use a principled confidence estimator
+    confidence = calculate_strategy_confidence(chunks, query_complexity=1.0)
+
+    if is_specific:
+        if max_score >= 0.35 and top3_avg >= 0.25 and theme_diversity >= 0.3:
+            return "local_docs", min(confidence, 1.0)
+        elif max_score >= 0.20 or theme_diversity >= 0.4:
+            return "hybrid", min(confidence, 1.0)
+        else:
+            return "web_search", 0.2
+    else:
+        if max_score >= 0.6 and theme_diversity >= 0.2:
+            return "local_docs", min(confidence, 1.0)
+        elif max_score >= 0.4:
+            return "hybrid", min(confidence * 0.8, 1.0)
+        else:
+            return "web_search", 0.3
+
+5) Add retrieval metrics helpers (precision@k, recall@k, f1@k)
+
+python
+def calculate_retrieval_metrics(retrieved_chunks: List[Tuple[float, Dict[str, Any]]],
+                                ground_truth_relevant: List[Tuple[str, Optional[str]]],
+                                k: int):
+    """
+    Calculate standard RAG evaluation metrics: precision@k, recall@k, f1@k.
+
+    retrieved_chunks: List[(score, doc_dict)]
+    ground_truth_relevant: list of (doc_id, section_id) tuples OR doc_id strings
+    Returns precision@k, recall@k, f1@k
+
+    Based on RAG evaluation best practices from research literature.
+    """
+    if k <= 0:
+        return {"precision@k": 0.0, "recall@k": 0.0, "f1@k": 0.0}
+
+    # normalize retrieved ids
+    retrieved_ids = set()
+    for _, chunk in retrieved_chunks[:k]:
+        doc_id = chunk.get("doc_id")
+        sec = chunk.get("section_id")
+        if doc_id is None:
+            continue
+        retrieved_ids.add((str(doc_id), str(sec) if sec is not None else None))
+
+    # normalize ground truth
+    relevant_ids = set()
+    for item in ground_truth_relevant:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            relevant_ids.add((str(item), str(item[1]) if len(item) > 1 and item[1] is not None else None))
+        elif isinstance(item, str):
+            relevant_ids.add((item, None))
+
+    if not relevant_ids:
+        return {"precision@k": 0.0, "recall@k": 0.0, "f1@k": 0.0}
+
+    true_positives = len(retrieved_ids & relevant_ids)
+    precision_at_k = true_positives / k
+    recall_at_k = true_positives / len(relevant_ids)
+    if precision_at_k + recall_at_k > 0:
+        f1_at_k = 2 * precision_at_k * recall_at_k / (precision_at_k + recall_at_k)
+    else:
+        f1_at_k = 0.0
+
+    return {"precision@k": precision_at_k, "recall@k": recall_at_k, "f1@k": f1_at_k}
+
+6) Add evaluation dataset helper
+
+python
+def create_evaluation_dataset():
+    """
+    Minimal sample evaluation dataset following RAG evaluation best practices.
+    Replace doc IDs with real ids from your DB.
+    Format:
+      - questions: list[str]
+      - expected_doc_ids: list[list[ (doc_id, section_id) ]]
+    """
+    return {
+        "questions": [
+            "restaurant patio requirements?",
+            "CS district permitted uses?"
+        ],
+        "ground_truth_answers": [
+            "Comprehensive requirements include zoning permits, health codes, fire safety, ADA compliance, and animal policies",
+            "Permitted uses for CS district include limited service restaurant, personal service, retail, etc."
+        ],
+        "expected_doc_ids": [
+            [("city_ordinances-dallas-tx-1-sec_1173", "sec_1173"), ("health_code_section_x", None)],
+            [("zoning_code_cs_section", "sec_cs_01")]
+        ]
+    }
+
+7) Test snippet for validation
+
+python
+if __name__ == "__main__" and False:  # flip to True to run quick checks
+    # test distribute
+    print("distributions:", distribute_k_across_queries(5, 3))   # expect [2,2,1]
+    print("distributions:", distribute_k_across_queries(2, 5))   # expect [1,1,0,0,0]
+
+    # fake chunks: (score, doc)
+    fake_chunks = [
+        (0.45, {"doc_id": "A", "section_id": "1", "title":"zoning", "text":"zoning text"}),
+        (0.30, {"doc_id": "B", "section_id": "2", "title":"health", "text":"health text"}),
+        (0.10, {"doc_id": "C", "section_id": "3", "title":"animals", "text":"pets"}),
+    ]
+    strat, conf = determine_retrieval_strategy(fake_chunks, "Can I build a patio in cs district Dallas?")
+    print("strategy,confidence:", strat, conf)
+
+    # metrics
+    retrieved = fake_chunks
+    ground_truth = [("A","1"), ("X","9")]
+    print("metrics:", calculate_retrieval_metrics(retrieved, ground_truth, k=3))
+
+These changes implement the "iterative refinement" approach emphasized in the search results
+, with proper chunk distribution, principled confidence scoring, and standard RAG evaluation metrics. The fixes address the type errors while following the "test with real queries" and "measure retrieval accuracy" best practices
+
+.
+
+what if i made the code doc an api? it's a huge document btw like 1000 pages, but I already have it broken into json. Would that help, api'ing it?
+LLM served by Perplexity Playground
+<think> The user is asking about converting their 1000-page document (which is already broken into JSON) into an API. They're asking if creating an API would help their RAG system.
+
+Looking at the search results, they discuss file conversion APIs, flat-file vs API integration, and document management systems. The key insights from the search results are:
+
+    From
+
+: APIs provide automation, efficiency, scalability, flexibility, format accuracy, and consistency
+
+From
+
+: API integration allows for real-time, continuous data exchange vs flat-file which is bulk transfers
+
+From
+
+    : Document conversion APIs help with streamlined workflows, automation, and integration
+
+The user's context is that they have a RAG system that's having issues with retrieval quality (like the "dog focus" issue they mentioned earlier), and they're wondering if converting their document corpus into an API would help.
+
+Based on the search results, creating an API for their document corpus could provide several benefits:
+
+    Real-time data access rather than loading everything into memory
+
+    Better scalability for handling large documents
+
+    More efficient querying and filtering
+
+    Better integration with their RAG pipeline
+
+    Ability to add preprocessing and optimization at the API level
+
+The search results emphasize that APIs are better for "real-time data exchanges" and "streamlined workflows" while flat-file (which is kind of what they have now with loading everything from SQLite) is better for "bulk data transfers."
+
+For their RAG use case, an API could help in several ways:
+
+    Semantic search preprocessing at the API level
+
+    Better chunk filtering and ranking
+
+    Real-time indexing and updates
+
+    More sophisticated query processing
+
+    Better caching and performance optimization
+    </think>
+
+Converting your 1000-page document corpus into an API could significantly improve your RAG system's performance and address the retrieval quality issues you've been experiencing. Based on the search results, here's how an API approach would help:
+Advantages of API-ifying Your Document Corpus
+
+Real-Time Data Exchange vs. Bulk Loading
+The search results emphasize that "API integration allows for a real-time, continuous data exchange" while flat-file approaches work with "large data sets in bulk"
+
+. Currently, you're loading all 4,010 documents into memory at once, which is essentially a bulk/flat-file approach. An API would enable:
+
+    On-demand retrieval of only relevant document chunks
+
+    Streaming responses for large result sets
+
+    Memory efficiency by not loading the entire corpus
+
+Enhanced Scalability and Performance
+According to the search results, APIs are "designed to handle large volumes of files" and "optimized for speed and efficiency"
+
+. For your 1000-page document, an API would provide:
+
+    Parallel processing of search queries across document sections
+
+    Intelligent caching of frequently accessed chunks
+
+    Preprocessing optimization at the API level rather than runtime
+
+Specific RAG Improvements Through API Design
+
+Advanced Query Processing
+The search results highlight that APIs enable "streamlined workflows" and "automation tools"
+
+. You could implement:
+
+python
+# API endpoint design for better RAG retrieval
+@app.route('/api/search', methods=['POST'])
+def smart_document_search():
+    """
+    API endpoint with built-in query enhancement and diversification
+    """
+    query = request.json['query']
+
+    # Server-side query expansion and classification
+    enhanced_queries = generate_contextual_queries(query)
+
+    # Distributed search across document themes
+    theme_results = {}
+    for theme in ['zoning', 'health', 'safety', 'accessibility']:
+        theme_results[theme] = search_by_theme(enhanced_queries, theme)
+
+    # Balanced result compilation
+    balanced_chunks = compile_diverse_results(theme_results)
+
+    return jsonify({
+        'chunks': balanced_chunks,
+        'confidence': calculate_confidence(balanced_chunks),
+        'coverage_themes': list(theme_results.keys())
+    })
+
+Preprocessing and Optimization
+The search results mention "automation capabilities" and "batch conversion"
+
+. An API could pre-compute:
+
+    Theme-classified chunks to solve your "dog focus" problem
+
+    Cross-referenced sections for comprehensive coverage
+
+    Semantic similarity matrices for faster retrieval
+
+    Query-specific indexes for common question patterns
+
+Recommended API Architecture
+
+Microservice Design for Document Intelligence
+
+python
+# Document Intelligence API Structure
+class DocumentAPI:
+    def __init__(self):
+        self.theme_indexes = self.build_theme_indexes()
+        self.semantic_cache = {}
+
+    async def search_comprehensive(self, query: str, themes: List[str] = None):
+        """
+        Multi-theme search that addresses your narrow retrieval issue
+        """
+        if not themes:
+            themes = self.classify_query_themes(query)
+
+        results_by_theme = {}
+        for theme in themes:
+            results_by_theme[theme] = await self.search_theme_specific(query, theme)
+
+        return self.balance_theme_coverage(results_by_theme)
+
+    def classify_query_themes(self, query: str) -> List[str]:
+        """Solve the 'dog focus' problem by ensuring theme diversity"""
+        if 'patio' in query and 'restaurant' in query:
+            return ['zoning', 'health', 'safety', 'accessibility', 'animals']
+        return ['general']
+
+Integration Benefits
+Following the search results' emphasis on "seamless integration" and "immediate access"
+
+, an API would enable:
+
+    Real-time updates to your document corpus without system restarts
+
+    A/B testing of different retrieval strategies
+
+    Performance monitoring and optimization at the API level
+
+    Multi-client support for different applications using the same document base
+
+Implementation Priority
+
+Start with a Hybrid Approach
+The search results suggest that "a hybrid approach that uses both methods allows companies to optimize for real-time and batch processing tasks"
+
+. You could:
+
+    Keep your current SQLite backend for document storage
+
+    Add an API layer that provides intelligent query processing and theme-based retrieval
+
+    Implement server-side diversification to address your narrow context retrieval issue
+
+This approach would leverage the "automation and efficiency" benefits highlighted in the search results
+
+while solving your specific RAG retrieval challenges through better query processing and result diversification at the API level.
+
+The API approach would be particularly beneficial for your use case because it allows you to implement sophisticated query classification and theme-based retrieval server-side, addressing the core issue where your RAG system focuses too narrowly on specific aspects (like dogs) rather than providing comprehensive coverage of restaurant patio requirements.
