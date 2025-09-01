@@ -9,46 +9,46 @@ COGS is a hybrid RAG (Retrieval-Augmented Generation) system that combines tradi
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        User Interface                       │
-│                   python hybrid_rag_search.py              │
+│                   python hybrid_rag_search.py               │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
-│                   Query Processing                         │
-│              • Input sanitization                          │
-│              • Query analysis                              │
-│              • Strategy selection                          │
+│                   Query Processing                          │
+│              • Input sanitization                           │
+│              • Query analysis                               │
+│              • Strategy selection                           │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
-│                 Hybrid Search Engine                       │
+│                 Hybrid Search Engine                        │
 │  ┌─────────────────┐           ┌─────────────────────────┐  │
 │  │  BM25 Search    │           │   Vector Search         │  │
-│  │ (Elasticsearch) │           │ (Mistral Embeddings)   │  │
+│  │ (Elasticsearch) │           │ (Mistral Embeddings)    │  │
 │  │                 │           │                         │  │
-│  │ • Keyword match │    +      │ • Semantic similarity  │  │
+│  │ • Keyword match │           │ • Semantic similarity   │  │
 │  │ • Exact terms   │           │ • Context understanding │  │
-│  │ • Field weights │           │ • Concept matching     │  │
+│  │ • Field weights │           │ • Concept matching      │  │
 │  └─────────────────┘           └─────────────────────────┘  │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
-│                Result Ranking & Selection                  │
-│              • Score combination                           │
-│              • Relevance filtering                         │
-│              • Top-K selection                             │
+│             Result Ranking & Selection                      │
+│              • Score combination                            │
+│              • Relevance filtering                          │
+│              • Top-K selection                              │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
-│                  Answer Generation                         │
-│                   (Mistral AI)                             │
-│              • Context assembly                            │
-│              • Prompt engineering                          │
-│              • Citation generation                         │
+│                  Answer Generation                          │
+│                   (Mistral AI)                              │
+│              • Context assembly                             │
+│              • Prompt engineering                           │
+│              • Citation generation                          │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
-│                  Query Logging                             │
-│               (Analytics & Monitoring)                     │
+│                  Query Logging                              │
+│               (Analytics & Monitoring)                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
