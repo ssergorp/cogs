@@ -52,6 +52,8 @@ COGS combines traditional keyword search (BM25) with semantic vector search to h
 
 ### Usage
 
+**Note**: Before using COGS, you'll need to load building code data into Elasticsearch and generate embeddings. See [docs/setup.md](docs/setup.md) for detailed instructions.
+
 **Ask a question about Dallas building codes:**
 ```bash
 python hybrid_rag_search.py "Can I build a starbucks in the CS district?"
