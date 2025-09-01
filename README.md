@@ -2,11 +2,11 @@
 
 An intelligent RAG (Retrieval-Augmented Generation) system for querying Dallas building codes and city ordinances using hybrid search and AI-powered responses.
 
-## 🏗️ Overview
+## Overview ##
 
 COGS combines traditional keyword search (BM25) with semantic vector search to help users navigate complex building codes. The system provides accurate, citation-rich responses to questions about zoning, permits, building requirements, and more.
 
-## ✨ Features
+## Features ##
 
 - **Hybrid Search**: Combines Elasticsearch BM25 with vector similarity search
 - **3,961 Building Code Documents**: Complete Dallas building code database with embeddings
@@ -14,15 +14,15 @@ COGS combines traditional keyword search (BM25) with semantic vector search to h
 - **Real-time Monitoring**: Kibana dashboard for query analytics
 - **Production Ready**: Error handling, fallbacks, and robust architecture
 
-## 🚀 Quick Start
+## 🚀 Quick Start 🚀 ##
 
-### Prerequisites
+### Prerequisites ##
 
 - Python 3.8+
 - Elasticsearch 8.x
 - Kibana 8.x (optional, for monitoring)
 
-### Installation
+### Installation ###
 
 1. **Clone the repository**
    ```bash
@@ -50,7 +50,7 @@ COGS combines traditional keyword search (BM25) with semantic vector search to h
      elasticsearch:8.11.0
    ```
 
-### Usage
+### Usage ###
 
 **Note**: Before using COGS, you'll need to load building code data into Elasticsearch and generate embeddings. See [docs/setup.md](docs/setup.md) for detailed instructions.
 
@@ -96,9 +96,9 @@ cogs-project/
     └── architecture.md         # System architecture
 ```
 
-## 🔧 Configuration
+## Configuration ##
 
-### Environment Variables
+### Environment Variables ###
 
 ```bash
 # Required
@@ -109,7 +109,7 @@ ELASTICSEARCH_URL=http://localhost:9200
 LOG_LEVEL=INFO
 ```
 
-### Elasticsearch Setup
+### Elasticsearch Setup ###
 
 The system requires an Elasticsearch index with building code documents and vector embeddings:
 
@@ -122,14 +122,14 @@ curl "localhost:9200/building_codes/_count"
 curl "localhost:9200/building_codes/_search" -d '{"query":{"exists":{"field":"embedding"}},"size":0}'
 ```
 
-## 🎯 Example Queries
+## Example Queries ##
 
 - **Zoning**: "Can I build a restaurant in the CS district?"
 - **Permits**: "What building permits do I need for a renovation?"
 - **Setbacks**: "What are the setback requirements for residential buildings?"
 - **Fire Safety**: "What are the fire safety requirements for commercial buildings?"
 
-## 📊 Monitoring
+## Monitoring ##
 
 Access the Kibana dashboard at `http://localhost:5601` to monitor:
 - Query volume and patterns
@@ -137,25 +137,7 @@ Access the Kibana dashboard at `http://localhost:5601` to monitor:
 - Popular search terms
 - System performance metrics
 
-## 🏗️ Architecture
-
-```
-User Query → Hybrid Search → Elasticsearch + Vector DB → LLM → Response
-                ↓
-           Query Logger → Elasticsearch Analytics → Kibana Dashboard
-```
-
-### Components
-
-1. **Hybrid Search Engine**: Combines BM25 and vector similarity
-2. **Document Store**: Elasticsearch with 3,961 building code sections
-3. **Vector Database**: 1024-dimensional Mistral embeddings
-4. **LLM Integration**: Mistral AI for response generation
-5. **Analytics**: Real-time query monitoring and insights
-
-## 🧪 Development
-
-### Running Tests
+### Running Tests ###
 
 ```bash
 python debug.py
@@ -163,7 +145,7 @@ python rag_debug.py
 python test_memory.py
 ```
 
-### Adding New Documents
+### Adding New Documents ###
 
 ```bash
 # Process new documents
@@ -173,30 +155,16 @@ python document_processor.py --source new_documents/
 python embedding_generator.py
 ```
 
-## 📈 Performance
+## Performance ##
 
 - **Search Latency**: <10ms for hybrid search
 - **Total Response Time**: ~2-3 seconds end-to-end
 - **Database Size**: 3,961 documents with full-text and vector search
 - **Accuracy**: High relevance for building code queries
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## 📄 License
+## License ##
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🆘 Support
-
-- **Issues**: Report bugs and feature requests on GitHub Issues
-- **Documentation**: See the `/docs` folder for detailed guides
-- **Contact**: For Dallas-specific building code questions, contact the Dallas Building Inspection Department
 
 ---
 
