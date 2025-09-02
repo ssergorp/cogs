@@ -1,4 +1,4 @@
-# COGS - City Ordinance Guidance System
+## COGS - City Ordinance Guidance System ##
 
 An intelligent RAG (Retrieval-Augmented Generation) system for querying Dallas building codes and city ordinances using hybrid search and AI-powered responses.
 
@@ -25,15 +25,10 @@ COGS combines traditional keyword search (BM25) with semantic vector search to h
 ### Installation ###
 
 1. **Clone the repository**
-   ```bash
-   git clone <repo-url>
-   cd cogs-project
-   ```
+
 
 2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+
 
 3. **Set up environment variables**
    ```bash
